@@ -1,2 +1,3 @@
-rsna-intracranial-aneurysm-detection\series
-rsna-intracranial-aneurysm-detection\segmentations
+rsna-intracranial-aneurysm-detection/segmentations/
+venv/
+rsna-intracranial-aneurysm-detection/series/
