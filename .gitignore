@@ -2,3 +2,4 @@ rsna-intracranial-aneurysm-detection/segmentations/
 venv/
 rsna-intracranial-aneurysm-detection/series/
 rsna-intracranial-aneurysm-detection/kaggle_evaluation/series/
+processed_data/
