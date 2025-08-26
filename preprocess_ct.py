@@ -5,253 +5,213 @@ import os
 import pydicom
 from scipy.signal import find_peaks
 from typing import Tuple, List
-from view3d_data import display_hu_distribution
+import collections
+from view3d_data import display_hu_distribution 
 
-# --- Robust HU Conversion (Your provided function) ---
+# --- Helper Functions ---
+# (robust_hu_conversion, load_dicom_series_manually, load_and_reorient_dicom, crop_to_body,
+# find_neck_cutoff, normalize_hu_window, resample_image are all unchanged and correct)
 
-def robust_hu_conversion(dicom_dataset: pydicom.Dataset) -> np.ndarray:
-    """
-    Converts pixel data to Hounsfield Units (HU) with a heuristic to avoid
-    re-converting data that may already be in HU.
+# ... [Paste all the other helper functions here exactly as they were in the last version] ...
 
-    Args:
-        dicom_dataset (pydicom.Dataset): A pydicom dataset for a single slice.
-
-    Returns:
-        np.ndarray: The pixel array, converted to HU if necessary.
-    """
-    pixel_array = dicom_dataset.pixel_array.astype(np.float32)
-
-    # Heuristic Check: If the RescaleSlope/Intercept tags are missing, or if the
-    # data range already looks like HU (e.g., contains typical air values),
-    # return the array as is.
-    if 'RescaleSlope' not in dicom_dataset or 'RescaleIntercept' not in dicom_dataset:
-        return pixel_array
+def robust_hu_conversion(dicom_dataset):
+    pixel_array = dicom_dataset.pixel_array
     
-    slope = float(dicom_dataset.RescaleSlope)
-    intercept = float(dicom_dataset.RescaleIntercept)
-
-    # Common padding values in DICOM are -2000. Air is ~ -1000 HU.
-    # If min value is already very low, assume it's already in HU.
-    if pixel_array.min() < -500:
-        return pixel_array
+    if 'RescaleSlope' in dicom_dataset and 'RescaleIntercept' in dicom_dataset:
+        slope = float(dicom_dataset.RescaleSlope)
+        intercept = float(dicom_dataset.RescaleIntercept)
+        if pixel_array.min() < -500 or pixel_array.min() == -2000:
+            return pixel_array
+        else:
+            return (pixel_array * slope) + intercept
+            
     else:
-        return (pixel_array * slope) + intercept
+        return pixel_array
 
-# --- NEW: Manual DICOM Loading Function ---
+# The only function that needs to be updated is load_dicom_series_manually
 
 def load_dicom_series_manually(dicom_folder_path: str) -> sitk.Image:
     """
-    Loads a DICOM series manually using pydicom to apply robust HU conversion
-    on a slice-by-slice basis.
-
-    Args:
-        dicom_folder_path (str): Path to the folder containing DICOM files.
-
-    Returns:
-        sitk.Image: A SimpleITK image with correctly applied HU conversion and metadata.
+    Loads a DICOM series manually, handling series with inconsistent slice dimensions
+    and spatially duplicate slices.
     """
-    # Use SimpleITK's reader just to get a sorted list of file names
     reader = sitk.ImageSeriesReader()
     dicom_names = reader.GetGDCMSeriesFileNames(dicom_folder_path)
     if not dicom_names:
         raise FileNotFoundError(f"No DICOM series found in directory: {dicom_folder_path}")
 
-    # Read all slices using pydicom
-    slices = [pydicom.dcmread(dcm) for dcm in dicom_names]
+    slices = [pydicom.dcmread(dcm, stop_before_pixels=False) for dcm in dicom_names]
 
-    # Sort slices by instance number or slice location to be safe
-    try:
-        slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
-    except AttributeError:
-        slices.sort(key=lambda x: int(x.InstanceNumber))
+    # --- Filter 1: Keep only slices with pixel data and consistent shapes ---
+    slices_with_pixels = [s for s in slices if hasattr(s, 'pixel_array') and hasattr(s, 'ImagePositionPatient')]
+    if not slices_with_pixels:
+        raise ValueError(f"No readable slices with pixel data found in {dicom_folder_path}")
+    slice_shapes = [s.pixel_array.shape for s in slices_with_pixels]
+    most_common_shape = collections.Counter(slice_shapes).most_common(1)[0][0]
+    uniform_slices = [s for s in slices_with_pixels if s.pixel_array.shape == most_common_shape]
+    if len(uniform_slices) < len(slices):
+        print(f"Warning: Discarded {len(slices) - len(uniform_slices)} slices with inconsistent shapes from series in {dicom_folder_path}.")
 
-    # Apply robust HU conversion to each slice and stack them
-
-    hu_slices = [robust_hu_conversion(s) for s in slices]
-    image_3d_np = np.stack(hu_slices, axis=0)
-    display_hu_distribution(image_3d_np, 'raw_array')#temp------------------------------------------->
-
-    # --- Create a SimpleITK image with correct metadata ---
-    image_itk = sitk.GetImageFromArray(image_3d_np)
-
-    # 1. Spacing
-    # XY spacing is from PixelSpacing
-    # Z spacing is the distance between slice centers
-    pixel_spacing = slices[0].PixelSpacing
-    slice_positions = [s.ImagePositionPatient[2] for s in slices]
+    # --- NEW Filter 2: Keep only spatially unique slices ---
+    spatially_unique_slices_dict = {}
+    for s in uniform_slices:
+        # The ImagePositionPatient tag is a pydicom MultiValue, convert it to a
+        # hashable tuple to use as a dictionary key.
+        position = tuple(s.ImagePositionPatient)
+        if position not in spatially_unique_slices_dict:
+            spatially_unique_slices_dict[position] = s
+            
+    unique_slices = list(spatially_unique_slices_dict.values())
     
-    # Calculate z-spacing robustly from slice positions
-    if len(slice_positions) > 1:
-        z_spacing = np.abs(slice_positions[1] - slice_positions[0])
-    else:
-        # Fallback to SliceThickness if only one slice
-        z_spacing = slices[0].SliceThickness if 'SliceThickness' in slices[0] else 1.0
+    if len(unique_slices) < len(uniform_slices):
+        print(f"Warning: Discarded {len(uniform_slices) - len(unique_slices)} spatially duplicate slices.")
+    # --- END NEW Filter ---
+    
+    # We must have at least 2 slices to form a volume with non-zero spacing
+    if len(unique_slices) < 2:
+        raise RuntimeError(f"Series in {dicom_folder_path} has fewer than 2 unique slices, cannot form a volume.")
+
+    # Sort the final, clean list of slices
+    try:
+        unique_slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+    except (AttributeError, KeyError):
+        unique_slices.sort(key=lambda x: int(x.InstanceNumber))
+
+    # Proceed with the rest of the function using 'unique_slices'
+    hu_slices = [robust_hu_conversion(s) for s in unique_slices]
+    image_3d_np = np.stack(hu_slices, axis=0)
+    image_itk = sitk.GetImageFromArray(image_3d_np)
+    
+    first_slice = unique_slices[0]
+    pixel_spacing = first_slice.PixelSpacing
+    slice_positions = [s.ImagePositionPatient[2] for s in unique_slices]
+    
+    # This calculation is now safe because all slice_positions are unique
+    z_spacing = np.median(np.diff(sorted(slice_positions)))
+    if z_spacing == 0:
+        # Fallback for safety, though it should not be triggered now
+        print(f"Warning: Calculated z-spacing is still zero for {dicom_folder_path}. Falling back to SliceThickness.")
+        z_spacing = first_slice.SliceThickness if 'SliceThickness' in first_slice else 1.0
 
     image_itk.SetSpacing((float(pixel_spacing[0]), float(pixel_spacing[1]), float(z_spacing)))
-
-    # 2. Origin (position of the first pixel in the first slice)
-    image_itk.SetOrigin(slices[0].ImagePositionPatient)
-
-    # 3. Direction Cosines (orientation of the axes)
-    orientation = slices[0].ImageOrientationPatient
-    direction_cosines = [float(o) for o in orientation]
-    # SimpleITK expects a 9-element flat list/tuple
-    # [d_x_col, d_y_col, d_z_col] = [[Xx, Xy, Xz], [Yx, Yy, Yz], [Zx, Zy, Zz]]
-    # DICOM provides [Xx, Xy, Xz, Yx, Yy, Yz]
-    row_cosines = direction_cosines[0:3]
-    col_cosines = direction_cosines[3:6]
+    image_itk.SetOrigin(first_slice.ImagePositionPatient)
+    orientation = first_slice.ImageOrientationPatient
+    row_cosines = [float(o) for o in orientation[0:3]]
+    col_cosines = [float(o) for o in orientation[3:6]]
     z_dir = np.cross(row_cosines, col_cosines)
-    full_direction = (*row_cosines, *col_cosines, *z_dir)
-    image_itk.SetDirection(full_direction)
-
+    image_itk.SetDirection((*row_cosines, *col_cosines, *z_dir))
+    
     return image_itk
 
 
-# --- Modular Preprocessing Steps (Updated Loader) ---
-
-def load_and_reorient_dicom(dicom_folder_path: str) -> Tuple[sitk.Image, Tuple[float, float, float]]:
-    """
-    Loads a DICOM series using a robust manual method and reorients it to a
-    standard 'upright' axial orientation (LPS) without changing its spacing.
-
-    Args:
-        dicom_folder_path (str): Path to the folder containing DICOM files.
-
-    Returns:
-        Tuple[sitk.Image, Tuple[float, float, float]]:
-            - The reoriented SimpleITK image.
-            - The original spacing of the reoriented image.
-    """
-    # Step 1: Load the series with the robust, manual pydicom method
+def load_and_reorient_dicom(dicom_folder_path: str) -> sitk.Image:
     itk_image = load_dicom_series_manually(dicom_folder_path)
+    return sitk.DICOMOrient(itk_image, 'LPS')
 
-    # Step 2: Reorient the manually loaded image
-    # Create a reference grid with the *original* spacing but a standard orientation
-    reorient_grid = create_reference_grid(itk_image, target_spacing=itk_image.GetSpacing())
+def crop_to_body(itk_image: sitk.Image, air_threshold_hu: int = -500) -> sitk.Image:
+    binary_mask = itk_image > air_threshold_hu; radius_mm = 3; spacing = itk_image.GetSpacing()
+    radius_pixels = [int(round(radius_mm / sp)) for sp in spacing]
+    opened_mask = sitk.BinaryMorphologicalOpening(binary_mask, kernelRadius=radius_pixels, kernelType=sitk.sitkBall)
+    relabeled_mask = sitk.RelabelComponent(sitk.ConnectedComponent(opened_mask), sortByObjectSize=True)
+    largest_component_mask = relabeled_mask == 1
+    filled_mask = sitk.BinaryFillhole(largest_component_mask); stats = sitk.LabelShapeStatisticsImageFilter()
+    stats.Execute(filled_mask)
+    if not stats.GetLabels(): print(f"Warning: crop_to_body failed. Returning original image."); return itk_image
+    bbox = stats.GetBoundingBox(1)
+    return sitk.RegionOfInterest(itk_image, size=bbox[3:], index=bbox[:3])
 
+def find_neck_cutoff(image_np: np.ndarray, body_threshold_hu: int = -200) -> int:
+    if image_np.ndim != 3 or image_np.size == 0: return 0
+    mask = image_np > body_threshold_hu; areas = np.sum(mask, axis=(1, 2))
+    non_zero_indices = np.where(areas > 0)[0]
+    if len(non_zero_indices) < 20: return 0
+    smoothed_areas = np.convolve(areas[non_zero_indices], np.ones(5)/5, mode='same')
+    peaks, _ = find_peaks(smoothed_areas, prominence=np.max(smoothed_areas)*0.1, distance=10)
+    if not peaks.any(): return 0
+    first_peak_idx = peaks[0]; search_area = smoothed_areas[first_peak_idx:]
+    valleys, _ = find_peaks(-search_area, prominence=np.max(search_area)*0.05, distance=10)
+    if not valleys.any(): return 0
+    cutoff_local_idx = valleys[0] + first_peak_idx
+    cutoff_z = non_zero_indices[cutoff_local_idx]
+    return int(cutoff_z)
+
+
+# --- NEW AND IMPROVED ALIGNMENT FUNCTION ---
+def align_to_midsagittal_plane(itk_image: sitk.Image) -> sitk.Image:
+    """
+    Aligns a 3D head CT image to its mid-sagittal plane using a robust,
+    multi-resolution registration strategy.
+    """
+    flipper = sitk.FlipImageFilter(); flipper.SetFlipAxes((True, False, False))
+    flipped_image = flipper.Execute(itk_image)
+    registration_method = sitk.ImageRegistrationMethod()
+    transform = sitk.Euler3DTransform()
+    image_center = itk_image.TransformContinuousIndexToPhysicalPoint([(sz-1)/2.0 for sz in itk_image.GetSize()])
+    transform.SetCenter(image_center)
+    registration_method.SetInitialTransform(transform, inPlace=False)
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
+    registration_method.SetMetricSamplingPercentage(0.20)
+    registration_method.SetOptimizerAsRegularStepGradientDescent(learningRate=0.5, minStep=0.001, numberOfIterations=200, relaxationFactor=0.5)
+    registration_method.SetOptimizerScalesFromPhysicalShift()
+    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
+    registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    registration_method.SetInterpolator(sitk.sitkLinear)
+    # registration_method.AddCommand(sitk.sitkIterationEvent)
+    print("Aligning head with multi-resolution strategy...")
+    final_transform = registration_method.Execute(itk_image, flipped_image)
+    print(f"Final transform parameters: {final_transform.GetParameters()}")
+    print(f"Optimizer stop condition: {registration_method.GetOptimizerStopConditionDescription()}")
     resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(reorient_grid)
+    resampler.SetReferenceImage(itk_image)
     resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetDefaultPixelValue(0) # Typical CT background
-    reoriented_itk_image = resampler.Execute(itk_image)
+    resampler.SetDefaultPixelValue(float(itk_image.GetPixel(0, 0, 0)))
+    resampler.SetTransform(final_transform)
+    aligned_image = resampler.Execute(itk_image)
+    return aligned_image
 
-    return reoriented_itk_image, reoriented_itk_image.GetSpacing()
 
+def normalize_hu_window(itk_image: sitk.Image, hu_window: Tuple[int, int]) -> sitk.Image:
+    hu_min, hu_max = hu_window; window_filter = sitk.IntensityWindowingImageFilter()
+    window_filter.SetWindowMinimum(float(hu_min)); window_filter.SetWindowMaximum(float(hu_max))
+    window_filter.SetOutputMinimum(0.0); window_filter.SetOutputMaximum(1.0)
+    return window_filter.Execute(itk_image)
 
-# --- All other functions from the previous refactoring remain UNCHANGED ---
-# They are included here for completeness of the script.
-
-def create_reference_grid(itk_image: sitk.Image, target_spacing: Tuple[float, float, float]) -> sitk.Image:
-    """Creates a reference SimpleITK Image for resampling."""
-    original_spacing = itk_image.GetSpacing()
-    original_size = itk_image.GetSize()
+def resample_image(itk_image: sitk.Image, target_spacing: Tuple[float, float, float]) -> sitk.Image:
+    original_spacing = itk_image.GetSpacing(); original_size = itk_image.GetSize()
     new_size = [int(round(osz * ospc / tspc)) for osz, ospc, tspc in zip(original_size, original_spacing, target_spacing)]
-    reference_image = sitk.Image(new_size, itk_image.GetPixelIDValue())
-    reference_image.SetSpacing(target_spacing)
-    reference_image.SetOrigin(itk_image.GetOrigin())
-    reference_image.SetDirection([1, 0, 0, 0, 1, 0, 0, 0, 1])  # Standard axial orientation
-    return reference_image
-
-def find_neck_cutoff(mask: np.ndarray) -> int:
-    """Analyzes the area of a binary mask to find the neck cutoff slice."""
-    if mask.ndim != 3 or mask.size == 0: return 0
-    areas = np.sum(mask, axis=(1, 2))
-    display_hu_distribution(areas, 'neck_crop_mask')
-    non_zero_indices = np.where(areas != 0)[0]
-    if len(non_zero_indices) < 3: return 0
-    areas_filtered = areas[non_zero_indices]
-    min_area, max_area = areas_filtered.min(), areas_filtered.max()
-    if max_area == min_area: return 0
-    normalized_areas = (areas_filtered - min_area) / (max_area - min_area)
-    peaks, _ = find_peaks(normalized_areas, prominence=0.005)
-    valleys, _ = find_peaks(-normalized_areas, prominence=0.005)
-    if len(peaks) == 0: return 0
-    if len(valleys) > 0:
-        min_valley_local_idx = np.argmin(normalized_areas[valleys])
-        min_valley_filtered_idx = valleys[min_valley_local_idx]
-        cutoff_z = non_zero_indices[min_valley_filtered_idx]
-        return int(cutoff_z)
-    return 0
-
-def apply_hu_window(itk_image: sitk.Image, hu_window: Tuple[int, int] = (-100, 400)) -> np.ndarray:
-    """Applies HU windowing and scales the result to a [0, 1] float range."""
-    image_hu = sitk.GetArrayFromImage(itk_image)
-    hu_min, hu_max = hu_window
-    clipped_image = np.clip(image_hu, hu_min, hu_max)
-    scaled_image = (clipped_image - hu_min) / (hu_max - hu_min)
-    return scaled_image.astype(np.float32)
-
-def crop_neck(scaled_image_np: np.ndarray, crop_threshold: float = (-200,600)) -> np.ndarray:
-    """Crops the z-axis to remove the neck region."""
-    binary_mask = ((scaled_image_np > crop_threshold[0]) & (scaled_image_np < crop_threshold[1]))
-    neck_cutoff_z = find_neck_cutoff(binary_mask)
-    return scaled_image_np[neck_cutoff_z:, :, :]
-
-def crop_to_largest_component(image_np: np.ndarray, crop_threshold: float = (-200,600)) -> np.ndarray:
-    """Crops X and Y axes to the bounding box of the largest connected component."""
-    binary_mask = ((image_np > crop_threshold[0]) & (image_np < crop_threshold[1])).astype(np.uint8)
-    mask_itk = sitk.GetImageFromArray(binary_mask)
-    connected_components = sitk.ConnectedComponent(mask_itk)
-    stats = sitk.LabelShapeStatisticsImageFilter()
-    stats.Execute(connected_components)
-    if not stats.GetLabels(): return image_np
-    largest_label = max(stats.GetLabels(), key=stats.GetNumberOfPixels)
-    x, y, z, sx, sy, sz = stats.GetBoundingBox(largest_label)
-    return image_np[z:(z + sz), y:(y + sy), x:(x + sx)]
-
-def resample_image(image_np: np.ndarray, current_spacing: Tuple[float, float, float], target_spacing: Tuple[float, float, float] = (0.58, 0.58, 1.2)) -> np.ndarray:
-    """Resamples a NumPy array to a new target spacing."""
-    image_itk = sitk.GetImageFromArray(image_np)
-    image_itk.SetSpacing(current_spacing)
-    final_grid = create_reference_grid(image_itk, target_spacing=target_spacing)
     resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(final_grid)
+    resampler.SetOutputSpacing(target_spacing); resampler.SetSize(new_size)
+    resampler.SetOutputDirection(itk_image.GetDirection()); resampler.SetOutputOrigin(itk_image.GetOrigin())
+    resampler.SetTransform(sitk.Transform()); resampler.SetDefaultPixelValue(0.0)
     resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetDefaultPixelValue(0.0)
-    final_itk_image = resampler.Execute(image_itk)
-    return sitk.GetArrayFromImage(final_itk_image)
+    return resampler.Execute(itk_image)
 
-# --- Main Pipeline Function (unchanged logic) ---
-def mask_tissue(img_np: np.ndarray,sof_tissue_range_hu: tuple) -> np.ndarray:
-    soft_tissue = np.where((img_np > sof_tissue_range_hu[0]) & (img_np < sof_tissue_range_hu[1]),img_np,img_np.min())
-    # soft_tissue_np = img_np[soft_tissue_idxs]
-    return soft_tissue
+# --- Main Pipeline Function (Order is correct) ---
 
 def preprocess_cta_scan(
     dicom_folder_path: str,
     target_spacing: tuple = (0.58, 0.58, 1.2),
-    hu_window: tuple = (0.4, 0.6),
-    crop_threshold: float = (-200,600),
-    sof_tissue_range_hu: tuple = (-600,1000)
+    cta_hu_window: tuple = (-100, 400),
 ) -> Tuple[np.ndarray, Tuple[float, float, float]]:
-    """Full preprocessing pipeline for a CTA scan."""
-    # Step 1: Load and Reorient (Now uses the robust manual loader)
-    reoriented_itk_image, original_spacing = load_and_reorient_dicom(dicom_folder_path)
-
-    # normalize data
-    reoriented_itk_image_np = sitk.GetArrayFromImage(reoriented_itk_image)
-    # min_reoriented_itk_image_np, max_reoriented_itk_image_np = np.min(reoriented_itk_image_np) , np.max(reoriented_itk_image_np)
-    # normalized_tissue = (reoriented_itk_image_np - min_reoriented_itk_image_np) / (max_reoriented_itk_image_np - min_reoriented_itk_image_np)
-    # display_hu_distribution(normalized_tissue,'normalized_tissue')
-   
-    # Step 2: get soft tissue
-    # sof_tissue_range_hu_normalized = (sof_tissue_range_hu-min_reoriented_itk_image_np) / (max_reoriented_itk_image_np - min_reoriented_itk_image_np)
-    soft_tissue_img_np = mask_tissue(reoriented_itk_image_np, sof_tissue_range_hu)
-    display_hu_distribution(soft_tissue_img_np,'soft_tissue_img_np')
-    # Step 3: normalize the data
-
-    scaled_image_np = soft_tissue_img_np#apply_hu_window(reoriented_itk_image, hu_window)
-    # Step 3: Crop Neck (Z-axis)
-    head_image_np = crop_neck(scaled_image_np, crop_threshold)
-    display_hu_distribution(head_image_np,'head_image_np')
-    # Step 4: Crop to Largest Component (X, Y axes)
-    cropped_head_image_np = crop_to_largest_component(head_image_np, crop_threshold)
-    display_hu_distribution(cropped_head_image_np,'cropped_head_image_np')
-    # Step 5: Final Resample
-    final_image_np = resample_image(
-        cropped_head_image_np,
-        current_spacing=original_spacing,
-        target_spacing=target_spacing
-    )
+    reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
+    clipped_itk = sitk.Clamp(reoriented_itk, sitk.sitkFloat32, -1024, 3000)
+    full_scan_np = sitk.GetArrayFromImage(clipped_itk)
+    neck_cutoff_z = find_neck_cutoff(full_scan_np, body_threshold_hu=-200)
+    head_and_shoulders_np = full_scan_np[neck_cutoff_z:, :, :]
+    if head_and_shoulders_np.shape[0] < 5:
+        raise RuntimeError(f"Neck cropping failed for {dicom_folder_path}, resulted in {head_and_shoulders_np.shape[0]} slices.")
+    head_and_shoulders_itk = sitk.GetImageFromArray(head_and_shoulders_np)
+    head_and_shoulders_itk.SetSpacing(clipped_itk.GetSpacing())
+    head_and_shoulders_itk.SetDirection(clipped_itk.GetDirection())
+    original_origin = np.array(clipped_itk.GetOrigin()); original_spacing = np.array(clipped_itk.GetSpacing())
+    z_direction_vector = np.array(clipped_itk.GetDirection())[6:]
+    new_origin = original_origin + neck_cutoff_z * original_spacing[2] * z_direction_vector
+    head_and_shoulders_itk.SetOrigin(new_origin.tolist())
+    head_itk = crop_to_body(head_and_shoulders_itk, air_threshold_hu=-500)
+    aligned_head_itk = align_to_midsagittal_plane(head_itk)
+    normalized_itk = normalize_hu_window(aligned_head_itk, hu_window=cta_hu_window)
+    final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing)
+    final_image_np = sitk.GetArrayFromImage(final_itk_image)
     return final_image_np, target_spacing
