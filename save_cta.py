@@ -15,7 +15,7 @@ OUTPUT_DIR = r'processed_data'
 CSV_LOG_PATH = os.path.join(OUTPUT_DIR, 'preprocessing_log.csv')
 
 # Use one less than your total cores to keep your system responsive
-NUM_PROCESSES = max(1, cpu_count() - 2)
+NUM_PROCESSES = max(1, cpu_count() - 1)
 
 def process_and_save_scan(args):
     """
