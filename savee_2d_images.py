@@ -8,7 +8,7 @@ import tqdm
 
 # --- Configuration ---
 # 1. Set the path to your folder containing .nii.gz files
-INPUT_FOLDER = Path("processed_data") 
+INPUT_FOLDER = Path("processed_data_v2") 
 
 # 2. Set the path for the output images
 OUTPUT_FOLDER = Path("output_slices")
