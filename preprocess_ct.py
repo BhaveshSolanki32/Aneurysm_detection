@@ -7,6 +7,7 @@ from scipy.signal import find_peaks
 from typing import Tuple, List, Optional
 import collections
 import gc
+from scipy.ndimage import gaussian_filter1d
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(4) 
 print('robust')
 # --- New Helper Function for Coordinates (This part is needed for the new functionality) ---
@@ -31,37 +32,67 @@ def get_physical_point_from_dicom(
     raise FileNotFoundError(f"Could not find DICOM slice with SOPInstanceUID {sop_uid} in {dicom_folder_path}")
 
 
-# --- Helper Functions (RESTORED TO YOUR ORIGINAL, WORKING VERSION) ---
+def correct_hu_value_if_peak_not_at_zero(data, sigma=7, prominence=1, num_peaks=3, tolerance=50):
+    if not isinstance(data, np.ndarray) or data.size == 0:
+        print("Warning: Input data is empty or not a numpy array.")
+        return False
+
+    flat_data = data.flatten()
+    if flat_data.size > 100_000:
+        flat_data = np.random.choice(flat_data, size=100_000, replace=False)
+
+    flat_data = np.round(flat_data).astype(int)
+
+    min_val = flat_data.min()
+    shifted_data = flat_data - min_val
+    
+    freq_dist = np.bincount(shifted_data)
+    original_values = np.arange(min_val, min_val + len(freq_dist))
+
+    smoothed_freq = gaussian_filter1d(freq_dist.astype(float), sigma=sigma)
+
+    indices, _ = find_peaks(smoothed_freq, prominence=prominence)
+    
+    if len(indices) == 0:
+        print("No peaks found.")
+        return False
+
+    heights = smoothed_freq[indices]
+    sorted_indices_by_height = indices[np.argsort(heights)[::-1]]
+    top_peak_indices = sorted_indices_by_height[:num_peaks]
+    top_peak_values = original_values[top_peak_indices]
+
+    # --- 5. Check if a peak is NEAR zero ---
+    result = any(abs(val) <= tolerance for val in top_peak_values)
+
+    return result
+
+
 
 # --- THIS FUNCTION IS NOW CORRECTED AND RESTORED TO YOUR ORIGINAL ---
 def robust_hu_conversion(dicom_dataset):
-    """
-    Converts raw pixel data to Hounsfield Units (HU) and corrects for
-    MONOCHROME1 photometric interpretation (inverted pixels).
-    """
-    pixel_array = dicom_dataset.pixel_array.astype(np.int32)
+    pixel_array = dicom_dataset.pixel_array
     
     # --- Part 1: Convert to HU (Your existing logic) ---
     hu_pixels = pixel_array
+    if 'PhotometricInterpretation' in dicom_dataset and dicom_dataset.PhotometricInterpretation == "MONOCHROME1":
+        max_hu = np.max(hu_pixels)
+        min_hu = np.min(hu_pixels)
+        hu_pixels = (max_hu + min_hu) - hu_pixels
+
     # return pixel_array
     if 'RescaleSlope' in dicom_dataset and 'RescaleIntercept' in dicom_dataset:
         slope = float(dicom_dataset.RescaleSlope)
         intercept = float(dicom_dataset.RescaleIntercept)
-        # Prevent double-conversion if already in HU
-        # hu_pixels = (pixel_array * slope) + intercept
 
-        if not (pixel_array.min() < -2500):
-            print('converting to hu')
-            hu_pixels = (pixel_array * slope) + intercept
+        hu_conv_pixels = (pixel_array * slope) + intercept
 
-    # --- Part 2: NEW - Check and Correct for MONOCHROME1 ---
-    if 'PhotometricInterpretation' in dicom_dataset and dicom_dataset.PhotometricInterpretation == "MONOCHROME1":
+        if not correct_hu_value_if_peak_not_at_zero(hu_conv_pixels):
+            hu_conv_pixels = hu_pixels
+    else:
+        hu_conv_pixels = hu_pixels
 
-        max_hu = np.max(hu_pixels)
-        min_hu = np.min(hu_pixels)
-        hu_pixels = (max_hu + min_hu) - hu_pixels
-        
-    return hu_pixels
+    return hu_conv_pixels
 
 def filter_bad_slices(image_3d_itk_list):
     final_itk_stack =[]
@@ -188,7 +219,8 @@ def align_to_midsagittal_plane(itk_image: sitk.Image) -> Tuple[sitk.Image, sitk.
     aligned_image = resampler.Execute(itk_image)
     return aligned_image, final_transform
 
-# --- Main Pipeline Function ---
+
+# --- Main Pipeline Function (Refactored for efficiency, retaining memory management) ---
 def preprocess_cta_scan(
     dicom_folder_path: str,
     target_spacing: tuple = (0.58, 0.58, 1.2),
@@ -204,49 +236,61 @@ def preprocess_cta_scan(
             dicom_folder_path, sop_instance_uid, initial_coords_xy
         )
 
+    # --- Step 1: Load and Sanitize ---
     reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
-    clipped_itk = sitk.Clamp(reoriented_itk, sitk.sitkFloat32, -1024, 3000)
-    del reoriented_itk
+    clipped_itk = sitk.Clamp(reoriented_itk, sitk.sitkFloat32, -1024, 1000)
+    del reoriented_itk # Original image no longer needed
 
-    full_scan_np = sitk.GetArrayFromImage(clipped_itk)
-    neck_cutoff_z = find_neck_cutoff(full_scan_np, body_threshold_hu=-200)
-    head_and_shoulders_np = full_scan_np[neck_cutoff_z:, :, :]
-    del full_scan_np 
+    # --- Step 2: Neck Cropping (REFACTORED FOR EFFICIENCY) ---
+    # Use a memory-efficient 'view' into the ITK image to find the cutoff point.
+    # This avoids creating a full NumPy copy of the entire scan.
+    full_scan_np_view = sitk.GetArrayViewFromImage(clipped_itk)
+    neck_cutoff_z = find_neck_cutoff(full_scan_np_view, body_threshold_hu=cta_hu_window[0])
 
+    # Perform the crop directly in SimpleITK using RegionOfInterest.
+    # This is faster, uses less memory, and automatically handles all metadata (origin, spacing, etc.).
+    original_size = clipped_itk.GetSize() # Size is in (x, y, z) order
+    index = [0, 0, int(neck_cutoff_z)]
+    size = [original_size[0], original_size[1], original_size[2] - int(neck_cutoff_z)]
 
-    if head_and_shoulders_np.shape[0] < 5:
-        raise RuntimeError(f"Neck cropping failed for {dicom_folder_path}, resulted in {head_and_shoulders_np.shape[0]} slices.")
-    head_and_shoulders_itk = sitk.GetImageFromArray(head_and_shoulders_np)
-    del head_and_shoulders_np 
+    if size[2] < 5:
+        raise RuntimeError(f"Neck cropping failed for {dicom_folder_path}, resulted in {size[2]} slices.")
+        
+    head_and_shoulders_itk = sitk.RegionOfInterest(clipped_itk, size=size, index=index)
+    del clipped_itk # The full-body clipped scan is no longer needed
 
-    head_and_shoulders_itk.SetSpacing(clipped_itk.GetSpacing())
-    head_and_shoulders_itk.SetDirection(clipped_itk.GetDirection())
-    original_origin = np.array(clipped_itk.GetOrigin()); original_spacing = np.array(clipped_itk.GetSpacing())
-    z_direction_vector = np.array(clipped_itk.GetDirection())[6:]
-    new_origin = original_origin + neck_cutoff_z * original_spacing[2] * z_direction_vector
-    head_and_shoulders_itk.SetOrigin(new_origin.tolist())
+    # --- Step 3: Body Cropping ---
     head_itk = crop_to_body(head_and_shoulders_itk, air_threshold_hu=-500)
-    del head_and_shoulders_itk 
+    del head_and_shoulders_itk # Intermediate cropped image no longer needed
 
-
+    # --- Step 4: Alignment ---
     aligned_head_itk, alignment_transform = align_to_midsagittal_plane(head_itk)
-    del head_itk 
-    gc.collect()
+    del head_itk # Unaligned head image no longer needed
+    gc.collect() # Good place for a garbage collection call after several large objects are freed
 
+    # --- Step 5: Coordinate Transformation ---
     if aneurysm_physical_point:
+        # Apply the alignment transform to the physical point
         aneurysm_physical_point = alignment_transform.TransformPoint(aneurysm_physical_point)
         print(f"Transformed physical point: {aneurysm_physical_point}")
+    
+    # --- Step 6: Normalization & Resampling ---
     normalized_itk = normalize_hu_window(aligned_head_itk, hu_window=cta_hu_window)
-    del aligned_head_itk 
+    del aligned_head_itk # Aligned but un-normalized image no longer needed
 
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing)
-    del normalized_itk 
+    del normalized_itk # Normalized but un-resampled image no longer needed
 
+    # --- Step 7: Final Conversion and Coordinate Calculation ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
+    
     final_voxel_coords = None
     if aneurysm_physical_point:
+        # Get final voxel coordinates from the final ITK image
         final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(aneurysm_physical_point)
-        final_voxel_coords = final_voxel_coords_xyz[::-1]
+        # Convert from (x, y, z) to NumPy's (z, y, x) indexing
+        final_voxel_coords = final_voxel_coords_xyz[::-1] 
         print(f"Final voxel coordinates (z, y, x): {final_voxel_coords}")
 
     return final_image_np, target_spacing, final_voxel_coords
+

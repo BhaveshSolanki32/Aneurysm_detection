@@ -14,7 +14,7 @@ INPUT_FOLDER = Path("processed_data_v2")
 OUTPUT_FOLDER = Path("output_slices")
 
 # 3. Set the number of parallel threads to use
-MAX_WORKERS = os.cpu_count() -2 # Use all available CPU cores, or 4 if detection fails
+MAX_WORKERS = os.cpu_count() -5 # Use all available CPU cores, or 4 if detection fails
 # --- End of Configuration ---
 
 def normalize_slice(slice_data):
