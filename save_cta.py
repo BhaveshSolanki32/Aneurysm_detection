@@ -1,4 +1,4 @@
-# Save this as run_preprocessing_v2.py
+# Save this as save_cta.py
 import os
 import pandas as pd
 import SimpleITK as sitk
@@ -13,20 +13,14 @@ sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(5)
 
 # --- CONFIGURATION ---
 BASE_PATH = r'rsna-intracranial-aneurysm-detection\series'
-OUTPUT_DIR = r'processed_data_v2' # Use a new folder to avoid confusion
+# --- It's highly recommended to use a new output directory for a fresh run ---
+OUTPUT_DIR = r'processed_data_v3' 
 CSV_LOG_PATH = os.path.join(OUTPUT_DIR, 'preprocessing_log.csv')
 NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'new_localization.csv')
 
 # --- NEW CONFIGURATION OPTIONS ---
-# Set to an integer (e.g., 50) to process only that many scans for a test run
-# Set to None to process all scans
 MAX_SCANS_TO_PROCESS = 50
-
-# Path to your original localization CSV
-# Example: r'path\to\your\localization.csv'
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv' 
-
-# Use one less than your total cores to keep your system responsive
 NUM_PROCESSES = 3
 
 
@@ -35,28 +29,13 @@ def process_and_save_scan(args):
     A wrapper function for a single scan. Takes a tuple of arguments.
     This function will be called by each parallel process.
     """
-    series_uid, base_path, output_dir, sop_uid, coords_str = args
+    # MODIFIED: Unpack the new `coords_list` argument
+    series_uid, base_path, output_dir, coords_list = args
     
     folder_path = os.path.join(base_path, series_uid)
     output_path = os.path.join(output_dir, f"{series_uid}.nii.gz")
     
-    # Prepare coordinates if they exist
-    coords_dict = None
-    if pd.notna(coords_str):
-        try:
-            # Safely convert the string "{'x': ...}" to a dictionary
-            coords_dict = ast.literal_eval(coords_str)
-        except (ValueError, SyntaxError):
-            return {
-                'SeriesInstanceUID': series_uid, 'status': 'Failed',
-                'shape_z_y_x': None, 'error': 'Invalid coordinate format',
-                'final_coords_zyx': None
-            }
-            
     if os.path.exists(output_path):
-        # Even if file exists, we might need to recalculate coords.
-        # For simplicity in this run, we skip if the image is already processed.
-        # To re-calculate labels for existing files, you'd need to modify this logic.
         return {
             'SeriesInstanceUID': series_uid, 'status': 'Skipped',
             'shape_z_y_x': None, 'error': 'File already exists',
@@ -64,24 +43,24 @@ def process_and_save_scan(args):
         }
         
     try:
-        processed_array, final_spacing, final_coords = preprocess_cta_scan(
+        # MODIFIED: Pass the list of coordinates to the main function
+        processed_array, final_spacing, final_coords_list = preprocess_cta_scan(
             folder_path, 
-            initial_coords_xy=coords_dict, 
-            sop_instance_uid=sop_uid
+            initial_coords_list=coords_list
         )
         
         if processed_array.size == 0:
              raise ValueError("Preprocessing returned an empty array.")
 
         sitk_image = sitk.GetImageFromArray(processed_array)
-        # SimpleITK spacing is (x, y, z), our target_spacing is (z, y, x)
         sitk_image.SetSpacing(final_spacing[::-1]) 
         sitk.WriteImage(sitk_image, output_path)
         
+        # MODIFIED: Return the list of final coordinates
         return {
             'SeriesInstanceUID': series_uid, 'status': 'Success',
             'shape_z_y_x': processed_array.shape, 'error': None,
-            'final_coords_zyx': final_coords
+            'final_coords_zyx': final_coords_list
         }
 
     except Exception as e:
@@ -99,33 +78,54 @@ if __name__ == '__main__':
         df_train = pd.read_csv(r'rsna-intracranial-aneurysm-detection\train.csv')
         df_loc = pd.read_csv(ORIGINAL_LOCALIZATION_CSV)
         
-        # Keep only CTA scans
         df_cta = df_train[df_train['Modality'] == 'CTA'].copy()
         
-        # Merge the localization data. Use a left merge to keep all CTA scans.
+        # Merge is correct, no changes needed here.
         df_merged = pd.merge(df_cta, df_loc, on='SeriesInstanceUID', how='left')
         
         uids_to_process = df_merged['SeriesInstanceUID'].unique().tolist()
         print(f"Found {len(uids_to_process)} unique CTA SeriesInstanceUIDs.")
 
-        # Apply the processing limit if specified
         if MAX_SCANS_TO_PROCESS is not None:
             uids_to_process = uids_to_process[:MAX_SCANS_TO_PROCESS]
             print(f"--- LIMITING to processing {len(uids_to_process)} scans for this run. ---")
-
-        # Create a dictionary for quick lookup
-        lookup_df = df_merged.set_index('SeriesInstanceUID')
+            
+        # --- MODIFICATION START: Correctly prepare tasks for all aneurysms ---
+        
+        # Group the merged dataframe by series UID to handle multiple aneurysms per series
+        grouped = df_merged.groupby('SeriesInstanceUID')
         
         tasks = []
-        for uid in uids_to_process:
-            record = lookup_df.loc[[uid]].iloc[0] # Get the first row for this UID
+        for uid, group in tqdm(grouped, desc="Preparing tasks"):
+             # We only care about processing UIDs that are in our target list
+            if uid not in uids_to_process:
+                continue
+                
+            coords_list_for_series = []
+            # Check if there are any valid localizations for this group
+            if not group['SOPInstanceUID'].isnull().all():
+                for _, row in group.iterrows():
+                    # Safely evaluate coordinates
+                    try:
+                        coords_dict = ast.literal_eval(row['coordinates'])
+                        coords_list_for_series.append({
+                            'sop_uid': row['SOPInstanceUID'],
+                            'coords_xy': coords_dict
+                        })
+                    except (ValueError, SyntaxError, TypeError):
+                        continue # Skip malformed or NaN coordinates
+            
+            # If the list is empty after checking all rows, pass None.
+            # Otherwise, pass the populated list.
+            final_coords_arg = coords_list_for_series if coords_list_for_series else None
+            
             tasks.append((
                 uid,
                 BASE_PATH,
                 OUTPUT_DIR,
-                record['SOPInstanceUID'],
-                record['coordinates']
+                final_coords_arg # This is now a list of dicts, or None
             ))
+        # --- MODIFICATION END ---
 
     except FileNotFoundError as e:
         print(f"Error reading CSV files: {e}")
@@ -143,19 +143,32 @@ if __name__ == '__main__':
     results_df = pd.DataFrame(results)
     results_df = results_df.sort_values(by='SeriesInstanceUID').reset_index(drop=True)
     
-    # --- Save the detailed processing log ---
     log_df = results_df[['SeriesInstanceUID', 'status', 'shape_z_y_x', 'error']]
     log_df.to_csv(CSV_LOG_PATH, index=False)
     print(f"Log file saved to: {CSV_LOG_PATH}")
 
-    # --- Save the new localization data ---
-    loc_df = results_df[results_df['final_coords_zyx'].notna()].copy()
-    loc_df = loc_df[['SeriesInstanceUID', 'final_coords_zyx']]
-    loc_df.to_csv(NEW_LOCALIZATION_CSV_PATH, index=False)
+    # --- MODIFICATION START: Correctly save the new localization data ---
+    
+    # Filter for successful results that actually have coordinate data
+    loc_df = results_df[
+        (results_df['status'] == 'Success') & 
+        (results_df['final_coords_zyx'].notna()) &
+        (results_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))
+    ].copy()
+
+    # The 'final_coords_zyx' column now contains lists of tuples.
+    # We use pandas' 'explode' to create a new row for each item in the list.
+    if not loc_df.empty:
+        loc_df = loc_df.explode('final_coords_zyx')
+    
+    final_loc_df = loc_df[['SeriesInstanceUID', 'final_coords_zyx']]
+    final_loc_df.to_csv(NEW_LOCALIZATION_CSV_PATH, index=False)
     print(f"New localization file saved to: {NEW_LOCALIZATION_CSV_PATH}")
+    
+    # --- MODIFICATION END ---
     
     status_counts = results_df['status'].value_counts()
     print("\n--- Summary ---")
     print(status_counts)
-    print(f"{loc_df.shape[0]} aneurysm locations were successfully transformed.")
+    print(f"{final_loc_df.shape[0]} aneurysm locations were successfully transformed.")
     print("-----------------")
