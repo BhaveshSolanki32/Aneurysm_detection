@@ -120,7 +120,7 @@ def load_dicom_series_manually(dicom_folder_path: str) -> sitk.Image:
         position = tuple(s.ImagePositionPatient)
         if position not in spatially_unique_slices_dict: spatially_unique_slices_dict[position] = s
     unique_slices = list(spatially_unique_slices_dict.values())
-    if len(unique_slices) < len(uniform_slices): print(f"Warning: Discarded {len(uniform_slices) - len(unique_slices)} spatially duplicate slices.")
+    if len(unique_slices) < len(uniform_slices): print(f"Warning: Discarded {len(uniform_slices) - len(uniform_slices)} spatially duplicate slices.")
     if len(unique_slices) < 2: raise RuntimeError(f"Series in {dicom_folder_path} has fewer than 2 unique slices, cannot form a volume.")
     try: unique_slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
     except (AttributeError, KeyError): unique_slices.sort(key=lambda x: int(x.InstanceNumber))
@@ -221,20 +221,25 @@ def align_to_midsagittal_plane(itk_image: sitk.Image) -> Tuple[sitk.Image, sitk.
 
 
 # --- Main Pipeline Function (Refactored for efficiency, retaining memory management) ---
+# --- THIS IS THE ONLY FUNCTION THAT HAS BEEN MODIFIED ---
 def preprocess_cta_scan(
     dicom_folder_path: str,
     target_spacing: tuple = (0.58, 0.58, 1.2),
     cta_hu_window: tuple = (-200, 500),
-    initial_coords_xy: Optional[dict] = None,
-    sop_instance_uid: Optional[str] = None
-) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[Tuple[int, int, int]]]:
+    # MODIFIED: Accepts a list of coordinate dictionaries, or None if no aneurysms.
+    initial_coords_list: Optional[List[dict]] = None
+) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[Tuple[int, int, int]]]]:
     
-    aneurysm_physical_point = None
-    if initial_coords_xy and sop_instance_uid:
-        print(f"Finding initial physical coordinates for SOP UID {sop_instance_uid}...")
-        aneurysm_physical_point = get_physical_point_from_dicom(
-            dicom_folder_path, sop_instance_uid, initial_coords_xy
-        )
+    aneurysm_physical_points = []
+    # MODIFIED: Check if the list exists and is not empty.
+    if initial_coords_list:
+        print(f"Finding initial physical coordinates for {len(initial_coords_list)} aneurysms...")
+        # MODIFIED: Loop to calculate the initial physical point for EACH aneurysm.
+        for coord_info in initial_coords_list:
+            point = get_physical_point_from_dicom(
+                dicom_folder_path, coord_info['sop_uid'], coord_info['coords_xy']
+            )
+            aneurysm_physical_points.append(point)
 
     # --- Step 1: Load and Sanitize ---
     reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
@@ -242,55 +247,54 @@ def preprocess_cta_scan(
     del reoriented_itk # Original image no longer needed
 
     # --- Step 2: Neck Cropping (REFACTORED FOR EFFICIENCY) ---
-    # Use a memory-efficient 'view' into the ITK image to find the cutoff point.
-    # This avoids creating a full NumPy copy of the entire scan.
     full_scan_np_view = sitk.GetArrayViewFromImage(clipped_itk)
     neck_cutoff_z = find_neck_cutoff(full_scan_np_view, body_threshold_hu=cta_hu_window[0])
-
-    # Perform the crop directly in SimpleITK using RegionOfInterest.
-    # This is faster, uses less memory, and automatically handles all metadata (origin, spacing, etc.).
-    original_size = clipped_itk.GetSize() # Size is in (x, y, z) order
+    original_size = clipped_itk.GetSize()
     index = [0, 0, int(neck_cutoff_z)]
     size = [original_size[0], original_size[1], original_size[2] - int(neck_cutoff_z)]
-
     if size[2] < 5:
         raise RuntimeError(f"Neck cropping failed for {dicom_folder_path}, resulted in {size[2]} slices.")
-        
     head_and_shoulders_itk = sitk.RegionOfInterest(clipped_itk, size=size, index=index)
-    del clipped_itk # The full-body clipped scan is no longer needed
+    del clipped_itk
 
     # --- Step 3: Body Cropping ---
     head_itk = crop_to_body(head_and_shoulders_itk, air_threshold_hu=-500)
-    del head_and_shoulders_itk # Intermediate cropped image no longer needed
+    del head_and_shoulders_itk
 
     # --- Step 4: Alignment ---
     aligned_head_itk, alignment_transform = align_to_midsagittal_plane(head_itk)
-    del head_itk # Unaligned head image no longer needed
-    gc.collect() # Good place for a garbage collection call after several large objects are freed
+    del head_itk
+    gc.collect()
 
     # --- Step 5: Coordinate Transformation ---
-    if aneurysm_physical_point:
-        # Apply the alignment transform to the physical point
-        aneurysm_physical_point = alignment_transform.TransformPoint(aneurysm_physical_point)
-        print(f"Transformed physical point: {aneurysm_physical_point}")
+    transformed_physical_points = []
+    # MODIFIED: If there are points to transform, loop through them.
+    if aneurysm_physical_points:
+        print("Transforming physical points...")
+        for point in aneurysm_physical_points:
+            transformed_point = alignment_transform.TransformPoint(point)
+            transformed_physical_points.append(transformed_point)
     
     # --- Step 6: Normalization & Resampling ---
     normalized_itk = normalize_hu_window(aligned_head_itk, hu_window=cta_hu_window)
-    del aligned_head_itk # Aligned but un-normalized image no longer needed
+    del aligned_head_itk
 
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing)
-    del normalized_itk # Normalized but un-resampled image no longer needed
+    del normalized_itk
 
     # --- Step 7: Final Conversion and Coordinate Calculation ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
     
-    final_voxel_coords = None
-    if aneurysm_physical_point:
-        # Get final voxel coordinates from the final ITK image
-        final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(aneurysm_physical_point)
-        # Convert from (x, y, z) to NumPy's (z, y, x) indexing
-        final_voxel_coords = final_voxel_coords_xyz[::-1] 
-        print(f"Final voxel coordinates (z, y, x): {final_voxel_coords}")
+    final_voxel_coords_list = None
+    # MODIFIED: If there are transformed points, calculate final voxel coords for all of them.
+    if transformed_physical_points:
+        final_voxel_coords_list = []
+        print("Calculating final voxel coordinates...")
+        for point in transformed_physical_points:
+            final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(point)
+            final_voxel_coords = final_voxel_coords_xyz[::-1] # Convert (x, y, z) to NumPy's (z, y, x)
+            final_voxel_coords_list.append(final_voxel_coords)
+        print(f"Final voxel coordinates (z, y, x): {final_voxel_coords_list}")
 
-    return final_image_np, target_spacing, final_voxel_coords
-
+    # MODIFIED: Return the list of final coordinates.
+    return final_image_np, target_spacing, final_voxel_coords_list
