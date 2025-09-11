@@ -27,7 +27,7 @@ MAX_SCANS_TO_PROCESS = 50
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv' 
 
 # Use one less than your total cores to keep your system responsive
-NUM_PROCESSES = max(1, cpu_count() - 6)
+NUM_PROCESSES = 3
 
 
 def process_and_save_scan(args):
