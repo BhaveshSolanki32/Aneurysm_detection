@@ -9,7 +9,65 @@ import collections
 import gc
 from scipy.ndimage import gaussian_filter1d
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(4) 
-print('robust')
+
+# --- Add this SINGLE, UNIFIED visualization function to your script ---
+import matplotlib.pyplot as plt
+import numpy as np
+from typing import Tuple
+
+def visualize_location_in_3d(
+    image_np: np.ndarray,
+    voxel_coords_zyx: Tuple[int, int, int],
+    title: str = "3D Orthogonal Views"
+):
+    """
+    Displays the three orthogonal planes (axial, coronal, sagittal) of a 3D image
+    volume, centered on the given ZYX voxel coordinates.
+    """
+    z, y, x = voxel_coords_zyx
+    
+    # --- Input Validation ---
+    if not (0 <= z < image_np.shape[0] and 0 <= y < image_np.shape[1] and 0 <= x < image_np.shape[2]):
+        print(f"Error: Voxel coordinates {voxel_coords_zyx} are out of bounds for image shape {image_np.shape}")
+        # Show the plot anyway, but centered on the middle of the image
+        z = image_np.shape[0] // 2
+        y = image_np.shape[1] // 2
+        x = image_np.shape[2] // 2
+        title += f"\nCOORDS OUT OF BOUNDS - Showing center instead"
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(title, fontsize=16)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+
+    # --- Axial View (Z-plane, top-down) ---
+    axes[0].imshow(image_np[z, :, :], cmap='gray', origin='lower')
+    axes[0].axhline(y, color='lime', linewidth=0.8)
+    axes[0].axvline(x, color='lime', linewidth=0.8)
+    axes[0].scatter(x, y, s=100, facecolors='none', edgecolors='lime', linewidth=1.5)
+    axes[0].set_title(f"Axial (Z = {z})")
+    axes[0].set_xlabel("X-axis")
+    axes[0].set_ylabel("Y-axis")
+
+    # --- Coronal View (Y-plane, front-back) ---
+    axes[1].imshow(image_np[:, y, :], cmap='gray', origin='lower', aspect='auto')
+    axes[1].axhline(z, color='lime', linewidth=0.8)
+    axes[1].axvline(x, color='lime', linewidth=0.8)
+    axes[1].scatter(x, z, s=100, facecolors='none', edgecolors='lime', linewidth=1.5)
+    axes[1].set_title(f"Coronal (Y = {y})")
+    axes[1].set_xlabel("X-axis")
+    axes[1].set_ylabel("Z-axis")
+
+    # --- Sagittal View (X-plane, side-to-side) ---
+    axes[2].imshow(image_np[:, :, x], cmap='gray', origin='lower', aspect='auto')
+    axes[2].axhline(z, color='lime', linewidth=0.8)
+    axes[2].axvline(y, color='lime', linewidth=0.8)
+    axes[2].scatter(y, z, s=100, facecolors='none', edgecolors='lime', linewidth=1.5)
+    axes[2].set_title(f"Sagittal (X = {x})")
+    axes[2].set_xlabel("Y-axis")
+    axes[2].set_ylabel("Z-axis")
+
+    plt.show()
+
 # --- New Helper Function for Coordinates (This part is needed for the new functionality) ---
 def get_physical_point_from_dicom(
     dicom_folder_path: str, sop_uid: str, coords_xy: dict
@@ -219,34 +277,45 @@ def align_to_midsagittal_plane(itk_image: sitk.Image) -> Tuple[sitk.Image, sitk.
     aligned_image = resampler.Execute(itk_image)
     return aligned_image, final_transform
 
+# --- REVISED preprocess_cta_scan (without alignment) ---
+# Replace your old function with this one.
 
-# --- Main Pipeline Function (Refactored for efficiency, retaining memory management) ---
-# --- THIS IS THE ONLY FUNCTION THAT HAS BEEN MODIFIED ---
 def preprocess_cta_scan(
     dicom_folder_path: str,
     target_spacing: tuple = (0.58, 0.58, 1.2),
     cta_hu_window: tuple = (-200, 500),
-    # MODIFIED: Accepts a list of coordinate dictionaries, or None if no aneurysms.
-    initial_coords_list: Optional[List[dict]] = None
+    initial_coords_list: Optional[List[dict]] = None,
+    DEBUG_MODE: bool = False
 ) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[Tuple[int, int, int]]]]:
-    
+
+    # --- Step 1: Load Initial Full Volume (No change) ---
+    reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
+
     aneurysm_physical_points = []
-    # MODIFIED: Check if the list exists and is not empty.
     if initial_coords_list:
-        print(f"Finding initial physical coordinates for {len(initial_coords_list)} aneurysms...")
-        # MODIFIED: Loop to calculate the initial physical point for EACH aneurysm.
         for coord_info in initial_coords_list:
             point = get_physical_point_from_dicom(
                 dicom_folder_path, coord_info['sop_uid'], coord_info['coords_xy']
             )
             aneurysm_physical_points.append(point)
 
-    # --- Step 1: Load and Sanitize ---
-    reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
-    clipped_itk = sitk.Clamp(reoriented_itk, sitk.sitkFloat32, -1024, 1000)
-    del reoriented_itk # Original image no longer needed
+    # --- VISUALIZATION POINT 1: "BEFORE" (No change) ---
+    if DEBUG_MODE and aneurysm_physical_points:
+        print("DEBUG: Displaying initial locations on original, reoriented volume...")
+        initial_image_np = sitk.GetArrayFromImage(reoriented_itk)
+        for i, initial_physical_point in enumerate(aneurysm_physical_points):
+            initial_voxel_coords_xyz = reoriented_itk.TransformPhysicalPointToIndex(initial_physical_point)
+            initial_voxel_coords_zyx = initial_voxel_coords_xyz[::-1]
+            visualize_location_in_3d(
+                image_np=initial_image_np,
+                voxel_coords_zyx=initial_voxel_coords_zyx,
+                title=f"BEFORE Processing (Aneurysm #{i+1})\nLocation in original scan: {initial_voxel_coords_zyx}"
+            )
+        del initial_image_np
 
-    # --- Step 2: Neck Cropping (REFACTORED FOR EFFICIENCY) ---
+    # --- Step 2: Pre-processing & Cropping (No change) ---
+    clipped_itk = sitk.Clamp(reoriented_itk, sitk.sitkFloat32, -1024, 1000)
+    del reoriented_itk
     full_scan_np_view = sitk.GetArrayViewFromImage(clipped_itk)
     neck_cutoff_z = find_neck_cutoff(full_scan_np_view, body_threshold_hu=cta_hu_window[0])
     original_size = clipped_itk.GetSize()
@@ -256,45 +325,49 @@ def preprocess_cta_scan(
         raise RuntimeError(f"Neck cropping failed for {dicom_folder_path}, resulted in {size[2]} slices.")
     head_and_shoulders_itk = sitk.RegionOfInterest(clipped_itk, size=size, index=index)
     del clipped_itk
-
-    # --- Step 3: Body Cropping ---
     head_itk = crop_to_body(head_and_shoulders_itk, air_threshold_hu=-500)
     del head_and_shoulders_itk
-
-    # --- Step 4: Alignment ---
-    aligned_head_itk, alignment_transform = align_to_midsagittal_plane(head_itk)
-    del head_itk
-    gc.collect()
-
-    # --- Step 5: Coordinate Transformation ---
-    transformed_physical_points = []
-    # MODIFIED: If there are points to transform, loop through them.
-    if aneurysm_physical_points:
-        print("Transforming physical points...")
-        for point in aneurysm_physical_points:
-            transformed_point = alignment_transform.TransformPoint(point)
-            transformed_physical_points.append(transformed_point)
     
-    # --- Step 6: Normalization & Resampling ---
+    # --- STEP 3: ALIGNMENT REMOVED ---
+    # The cropped head_itk image is now passed directly to the next steps.
+    # We create an identity transform so the coordinate logic remains valid.
+    aligned_head_itk = head_itk
+    identity_transform = sitk.Transform() 
+    
+    # --- Step 4: Transform Coordinates (Now uses the identity transform) ---
+    transformed_physical_points = []
+    if aneurysm_physical_points:
+        for point in aneurysm_physical_points:
+            # Applying an identity transform returns the same point, which is what we want.
+            transformed_point = identity_transform.TransformPoint(point) 
+            transformed_physical_points.append(transformed_point)
+
+    # --- Step 5: Normalization & Resampling ---
     normalized_itk = normalize_hu_window(aligned_head_itk, hu_window=cta_hu_window)
     del aligned_head_itk
-
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing)
     del normalized_itk
 
-    # --- Step 7: Final Conversion and Coordinate Calculation ---
+    # --- Step 6: Final Conversion and Coordinate Calculation ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
-    
     final_voxel_coords_list = None
-    # MODIFIED: If there are transformed points, calculate final voxel coords for all of them.
     if transformed_physical_points:
         final_voxel_coords_list = []
-        print("Calculating final voxel coordinates...")
         for point in transformed_physical_points:
             final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(point)
-            final_voxel_coords = final_voxel_coords_xyz[::-1] # Convert (x, y, z) to NumPy's (z, y, x)
+            final_voxel_coords = final_voxel_coords_xyz[::-1]
             final_voxel_coords_list.append(final_voxel_coords)
-        print(f"Final voxel coordinates (z, y, x): {final_voxel_coords_list}")
 
-    # MODIFIED: Return the list of final coordinates.
+    # --- VISUALIZATION POINT 2: "AFTER" (No change) ---
+    if DEBUG_MODE and final_voxel_coords_list:
+        print("DEBUG: Displaying final transformed locations on processed volume.")
+        for i, final_coords_zyx in enumerate(final_voxel_coords_list):
+            visualize_location_in_3d(
+                image_np=final_image_np,
+                voxel_coords_zyx=final_coords_zyx,
+                title=f"AFTER Processing (Aneurysm #{i+1})\nFinal location in processed scan: {final_coords_zyx}"
+            )
+
     return final_image_np, target_spacing, final_voxel_coords_list
+
+

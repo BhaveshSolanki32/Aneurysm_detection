@@ -9,19 +9,19 @@ import ast # To safely evaluate the string representation of the dictionary
 
 # IMPORTANT: Make sure your preprocessing script is in the same directory
 from preprocess_ct import preprocess_cta_scan
-sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(5) 
+sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2) 
 
 # --- CONFIGURATION ---
 BASE_PATH = r'rsna-intracranial-aneurysm-detection\series'
 # --- It's highly recommended to use a new output directory for a fresh run ---
-OUTPUT_DIR = r'processed_data_v3' 
+OUTPUT_DIR = r'processed_data_v2' 
 CSV_LOG_PATH = os.path.join(OUTPUT_DIR, 'preprocessing_log.csv')
 NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'new_localization.csv')
 
 # --- NEW CONFIGURATION OPTIONS ---
-MAX_SCANS_TO_PROCESS = 50
+MAX_SCANS_TO_PROCESS = None
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv' 
-NUM_PROCESSES = 3
+NUM_PROCESSES = 4
 
 
 def process_and_save_scan(args):
