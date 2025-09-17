@@ -1,0 +1,55 @@
+[Starting phase 1: Adapter Training]
+Epoch 1/7 -> Train Loss: 0.4464, Test Loss: 0.3038, Test AUC: 0.8951
+-> New best model saved with AUC: 0.8951
+Epoch 2/7 -> Train Loss: 0.4119, Test Loss: 0.3658, Test AUC: 0.8980
+-> New best model saved with AUC: 0.8980
+Epoch 3/7 -> Train Loss: 0.3959, Test Loss: 0.2832, Test AUC: 0.9046
+-> New best model saved with AUC: 0.9046
+Epoch 4/7 -> Train Loss: 0.3856, Test Loss: 0.2582, Test AUC: 0.9086
+-> New best model saved with AUC: 0.9086
+Epoch 5/7 -> Train Loss: 0.3767, Test Loss: 0.3599, Test AUC: 0.9102
+-> New best model saved with AUC: 0.9102
+Epoch 6/7 -> Train Loss: 0.3644, Test Loss: 0.2963, Test AUC: 0.9115
+-> New best model saved with AUC: 0.9115
+Epoch 7/7 -> Train Loss: 0.3594, Test Loss: 0.3366, Test AUC: 0.9118
+-> New best model saved with AUC: 0.9118
+
+[Starting phase 2: Full Fine-Tuning]
+Epoch 8/25 -> Train Loss: 0.4485, Test Loss: 0.4520, Test AUC: 0.9102
+-> AUC did not improve. Patience: 1/5
+Epoch 9/25 -> Train Loss: 0.3946, Test Loss: 0.3249, Test AUC: 0.9103
+-> AUC did not improve. Patience: 2/5
+Epoch 10/25 -> Train Loss: 0.3830, Test Loss: 0.2734, Test AUC: 0.9103
+-> AUC did not improve. Patience: 3/5
+Epoch 11/25 -> Train Loss: 0.3731, Test Loss: 0.3227, Test AUC: 0.9214
+-> New best model saved with AUC: 0.9214
+Epoch 12/25 -> Train Loss: 0.3658, Test Loss: 0.2855, Test AUC: 0.9214
+-> New best model saved with AUC: 0.9214
+Epoch 13/25 -> Train Loss: 0.3626, Test Loss: 0.3337, Test AUC: 0.9231
+-> New best model saved with AUC: 0.9231
+Epoch 14/25 -> Train Loss: 0.3530, Test Loss: 0.2683, Test AUC: 0.9197
+-> AUC did not improve. Patience: 1/5
+Epoch 15/25 -> Train Loss: 0.3488, Test Loss: 0.2232, Test AUC: 0.9237
+-> New best model saved with AUC: 0.9237
+Epoch 16/25 -> Train Loss: 0.3411, Test Loss: 0.3144, Test AUC: 0.9249
+-> New best model saved with AUC: 0.9249
+Epoch 17/25 -> Train Loss: 0.3288, Test Loss: 0.3511, Test AUC: 0.9279
+-> New best model saved with AUC: 0.9279
+Epoch 18/25 -> Train Loss: 0.3101, Test Loss: 0.3322, Test AUC: 0.9296
+-> New best model saved with AUC: 0.9296
+Epoch 19/25 -> Train Loss: 0.2872, Test Loss: 0.2601, Test AUC: 0.9397
+-> New best model saved with AUC: 0.9397
+Epoch 20/25 -> Train Loss: 0.2664, Test Loss: 0.1785, Test AUC: 0.9448
+-> New best model saved with AUC: 0.9448
+Epoch 21/25 -> Train Loss: 0.2501, Test Loss: 0.2404, Test AUC: 0.9450
+-> New best model saved with AUC: 0.9450
+Epoch 22/25 -> Train Loss: 0.2363, Test Loss: 0.2128, Test AUC: 0.9517
+-> New best model saved with AUC: 0.9517
+Epoch 23/37 -> Train Loss: 0.2815, Test Loss: 0.2315, Test AUC: 0.9497
+-> AUC did not improve. Patience: 1/5
+Epoch 24/37 -> Train Loss: 0.2673, Test Loss: 0.2195, Test AUC: 0.9507
+-> AUC did not improve. Patience: 2/5
+Epoch 25/37 -> Train Loss: 0.2540, Test Loss: 0.2845, Test AUC: 0.9521
+-> AUC did not improve. Patience: 3/5
+Epoch 26/37 -> Train Loss: 0.2446, Test Loss: 0.1496, Test AUC: 0.9544
+-> New best model saved with AUC: 0.9544
