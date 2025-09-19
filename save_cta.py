@@ -8,18 +8,19 @@ from tqdm import tqdm
 import ast # To safely evaluate the string representation of the dictionary
 
 # IMPORTANT: Make sure your preprocessing script is in the same directory
+# This assumes you are using the preprocess_ct.py that accepts and returns location data
 from preprocess_ct import preprocess_cta_scan
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2) 
 
 # --- CONFIGURATION ---
 BASE_PATH = r'rsna-intracranial-aneurysm-detection\series'
 # --- It's highly recommended to use a new output directory for a fresh run ---
-OUTPUT_DIR = r'processed_data_v2' 
+OUTPUT_DIR = r'processed_data_v3' 
 CSV_LOG_PATH = os.path.join(OUTPUT_DIR, 'preprocessing_log.csv')
 NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'new_localization.csv')
 
 # --- NEW CONFIGURATION OPTIONS ---
-MAX_SCANS_TO_PROCESS = None
+MAX_SCANS_TO_PROCESS = 20
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv' 
 NUM_PROCESSES = 4
 
@@ -78,10 +79,15 @@ if __name__ == '__main__':
         df_train = pd.read_csv(r'rsna-intracranial-aneurysm-detection\train.csv')
         df_loc = pd.read_csv(ORIGINAL_LOCALIZATION_CSV)
         
-        df_cta = df_train[df_train['Modality'] == 'CTA'].copy()
+        # ---- YOUR ORIGINAL DATA PREPARATION LOGIC ----
+        # Drop duplicates from train.csv to prevent the N x N join problem
+        df_train_unique = df_train.drop_duplicates(subset=['SeriesInstanceUID'])
+
+        df_cta = df_train_unique[df_train_unique['Modality'] == 'CTA'].copy()
         
-        # Merge is correct, no changes needed here.
+        # This merge is now safe because df_cta has unique SeriesInstanceUIDs
         df_merged = pd.merge(df_cta, df_loc, on='SeriesInstanceUID', how='left')
+        # ---- END OF YOUR ORIGINAL LOGIC (WITH THE FIX) ----
         
         uids_to_process = df_merged['SeriesInstanceUID'].unique().tolist()
         print(f"Found {len(uids_to_process)} unique CTA SeriesInstanceUIDs.")
@@ -90,8 +96,6 @@ if __name__ == '__main__':
             uids_to_process = uids_to_process[:MAX_SCANS_TO_PROCESS]
             print(f"--- LIMITING to processing {len(uids_to_process)} scans for this run. ---")
             
-        # --- MODIFICATION START: Correctly prepare tasks for all aneurysms ---
-        
         # Group the merged dataframe by series UID to handle multiple aneurysms per series
         grouped = df_merged.groupby('SeriesInstanceUID')
         
@@ -108,10 +112,13 @@ if __name__ == '__main__':
                     # Safely evaluate coordinates
                     try:
                         coords_dict = ast.literal_eval(row['coordinates'])
+                        # --- ONLY CHANGE 1: ADD LOCATION STRING ---
                         coords_list_for_series.append({
                             'sop_uid': row['SOPInstanceUID'],
-                            'coords_xy': coords_dict
+                            'coords_xy': coords_dict,
+                            'location': row['location'] # Pass the location
                         })
+                        # --- END OF CHANGE 1 ---
                     except (ValueError, SyntaxError, TypeError):
                         continue # Skip malformed or NaN coordinates
             
@@ -125,7 +132,6 @@ if __name__ == '__main__':
                 OUTPUT_DIR,
                 final_coords_arg # This is now a list of dicts, or None
             ))
-        # --- MODIFICATION END ---
 
     except FileNotFoundError as e:
         print(f"Error reading CSV files: {e}")
@@ -147,7 +153,7 @@ if __name__ == '__main__':
     log_df.to_csv(CSV_LOG_PATH, index=False)
     print(f"Log file saved to: {CSV_LOG_PATH}")
 
-    # --- MODIFICATION START: Correctly save the new localization data ---
+    # --- ONLY CHANGE 2: REPLACE FINAL CSV SAVING LOGIC ---
     
     # Filter for successful results that actually have coordinate data
     loc_df = results_df[
@@ -156,16 +162,46 @@ if __name__ == '__main__':
         (results_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))
     ].copy()
 
-    # The 'final_coords_zyx' column now contains lists of tuples.
-    # We use pandas' 'explode' to create a new row for each item in the list.
     if not loc_df.empty:
+        # Explode the list of dictionaries into separate rows
         loc_df = loc_df.explode('final_coords_zyx')
-    
-    final_loc_df = loc_df[['SeriesInstanceUID', 'final_coords_zyx']]
+        
+        # Convert the column of dictionaries into separate columns ('final_coords_zyx', 'location')
+        extracted_data = loc_df['final_coords_zyx'].apply(pd.Series)
+        
+        # Use a safe join to combine the SeriesInstanceUID with the new data
+        final_loc_df = loc_df[['SeriesInstanceUID']].join(extracted_data)
+        
+        # Extract z, y, x coordinates from the tuple into separate columns
+        coords = pd.DataFrame(final_loc_df['final_coords_zyx'].tolist(), index=final_loc_df.index, columns=['coord_z', 'coord_y', 'coord_x'])
+        final_loc_df = pd.concat([final_loc_df, coords], axis=1)
+        
+        # One-Hot Encoding Logic
+        final_loc_df['Aneurysm Present'] = 1
+        location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
+        
+        location_dummies = pd.get_dummies(final_loc_df['location'])
+        for col in location_cols:
+            if col not in location_dummies.columns:
+                location_dummies[col] = 0
+        
+        # Convert all dummy columns to integers (0 or 1)
+        location_dummies = location_dummies[location_cols].astype(int)
+                
+        final_loc_df = pd.concat([final_loc_df, location_dummies], axis=1)
+        
+        # Select and reorder the final columns as requested
+        final_cols = ['SeriesInstanceUID', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
+        final_loc_df = final_loc_df[final_cols]
+    else:
+        # Create an empty dataframe with the correct columns if no aneurysms were processed
+        final_cols = ['SeriesInstanceUID', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
+        final_loc_df = pd.DataFrame(columns=final_cols)
+    final_loc_df.drop_duplicates(inplace=True)
     final_loc_df.to_csv(NEW_LOCALIZATION_CSV_PATH, index=False)
     print(f"New localization file saved to: {NEW_LOCALIZATION_CSV_PATH}")
     
-    # --- MODIFICATION END ---
+    # --- END OF CHANGE 2 ---
     
     status_counts = results_df['status'].value_counts()
     print("\n--- Summary ---")

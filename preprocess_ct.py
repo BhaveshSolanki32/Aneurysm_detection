@@ -278,7 +278,8 @@ def align_to_midsagittal_plane(itk_image: sitk.Image) -> Tuple[sitk.Image, sitk.
     return aligned_image, final_transform
 
 # --- REVISED preprocess_cta_scan (without alignment) ---
-# Replace your old function with this one.
+# This is the ONLY function with changes.
+# It now accepts and returns the 'location' string along with the coordinates.
 
 def preprocess_cta_scan(
     dicom_folder_path: str,
@@ -286,24 +287,30 @@ def preprocess_cta_scan(
     cta_hu_window: tuple = (-200, 500),
     initial_coords_list: Optional[List[dict]] = None,
     DEBUG_MODE: bool = False
-) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[Tuple[int, int, int]]]]:
+) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[dict]]]: # MODIFIED: Return type
 
     # --- Step 1: Load Initial Full Volume (No change) ---
     reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
 
-    aneurysm_physical_points = []
+    # MODIFIED: This list will now store dictionaries to hold extra info
+    aneurysm_physical_points_info = [] 
     if initial_coords_list:
         for coord_info in initial_coords_list:
             point = get_physical_point_from_dicom(
                 dicom_folder_path, coord_info['sop_uid'], coord_info['coords_xy']
             )
-            aneurysm_physical_points.append(point)
+            # Store the physical point AND its original location string
+            aneurysm_physical_points_info.append({
+                'physical_point': point,
+                'location': coord_info.get('location', None) # Safely get location
+            })
 
-    # --- VISUALIZATION POINT 1: "BEFORE" (No change) ---
-    if DEBUG_MODE and aneurysm_physical_points:
+    # --- VISUALIZATION POINT 1: "BEFORE" (No change in logic) ---
+    if DEBUG_MODE and aneurysm_physical_points_info:
         print("DEBUG: Displaying initial locations on original, reoriented volume...")
         initial_image_np = sitk.GetArrayFromImage(reoriented_itk)
-        for i, initial_physical_point in enumerate(aneurysm_physical_points):
+        for i, info in enumerate(aneurysm_physical_points_info):
+            initial_physical_point = info['physical_point']
             initial_voxel_coords_xyz = reoriented_itk.TransformPhysicalPointToIndex(initial_physical_point)
             initial_voxel_coords_zyx = initial_voxel_coords_xyz[::-1]
             visualize_location_in_3d(
@@ -328,21 +335,23 @@ def preprocess_cta_scan(
     head_itk = crop_to_body(head_and_shoulders_itk, air_threshold_hu=-500)
     del head_and_shoulders_itk
     
-    # --- STEP 3: ALIGNMENT REMOVED ---
-    # The cropped head_itk image is now passed directly to the next steps.
-    # We create an identity transform so the coordinate logic remains valid.
+    # --- STEP 3: ALIGNMENT REMOVED (No change) ---
     aligned_head_itk = head_itk
     identity_transform = sitk.Transform() 
     
     # --- Step 4: Transform Coordinates (Now uses the identity transform) ---
-    transformed_physical_points = []
-    if aneurysm_physical_points:
-        for point in aneurysm_physical_points:
-            # Applying an identity transform returns the same point, which is what we want.
-            transformed_point = identity_transform.TransformPoint(point) 
-            transformed_physical_points.append(transformed_point)
+    # MODIFIED: This list will also store dictionaries
+    transformed_physical_points_info = []
+    if aneurysm_physical_points_info:
+        for info in aneurysm_physical_points_info:
+            # Applying an identity transform returns the same point
+            transformed_point = identity_transform.TransformPoint(info['physical_point']) 
+            transformed_physical_points_info.append({
+                'physical_point': transformed_point,
+                'location': info['location'] # Carry the location string forward
+            })
 
-    # --- Step 5: Normalization & Resampling ---
+    # --- Step 5: Normalization & Resampling (No change) ---
     normalized_itk = normalize_hu_window(aligned_head_itk, hu_window=cta_hu_window)
     del aligned_head_itk
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing)
@@ -350,24 +359,30 @@ def preprocess_cta_scan(
 
     # --- Step 6: Final Conversion and Coordinate Calculation ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
-    final_voxel_coords_list = None
-    if transformed_physical_points:
-        final_voxel_coords_list = []
-        for point in transformed_physical_points:
-            final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(point)
+    
+    # MODIFIED: The final list will contain dictionaries
+    final_output_list = None
+    if transformed_physical_points_info:
+        final_output_list = []
+        for info in transformed_physical_points_info:
+            final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(info['physical_point'])
             final_voxel_coords = final_voxel_coords_xyz[::-1]
-            final_voxel_coords_list.append(final_voxel_coords)
+            # Create the final output dictionary for this aneurysm
+            final_output_list.append({
+                'final_coords_zyx': final_voxel_coords,
+                'location': info['location']
+            })
 
-    # --- VISUALIZATION POINT 2: "AFTER" (No change) ---
-    if DEBUG_MODE and final_voxel_coords_list:
+    # --- VISUALIZATION POINT 2: "AFTER" (No change in logic) ---
+    if DEBUG_MODE and final_output_list:
         print("DEBUG: Displaying final transformed locations on processed volume.")
-        for i, final_coords_zyx in enumerate(final_voxel_coords_list):
+        for i, info in enumerate(final_output_list):
+            final_coords_zyx = info['final_coords_zyx']
             visualize_location_in_3d(
                 image_np=final_image_np,
                 voxel_coords_zyx=final_coords_zyx,
                 title=f"AFTER Processing (Aneurysm #{i+1})\nFinal location in processed scan: {final_coords_zyx}"
             )
 
-    return final_image_np, target_spacing, final_voxel_coords_list
-
-
+    # MODIFIED: Return the final list of dictionaries
+    return final_image_np, target_spacing, final_output_list

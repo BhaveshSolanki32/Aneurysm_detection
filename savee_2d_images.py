@@ -8,10 +8,10 @@ import tqdm
 
 # --- Configuration ---
 # 1. Set the path to your folder containing .nii.gz files
-INPUT_FOLDER = Path("processed_data_v2") 
+INPUT_FOLDER = Path("processed_data_v3") 
 
 # 2. Set the path for the output images
-OUTPUT_FOLDER = Path("output_slices")
+OUTPUT_FOLDER = Path("output_slices_v3")
 
 # 3. Set the number of parallel threads to use
 MAX_WORKERS = os.cpu_count() -5 # Use all available CPU cores, or 4 if detection fails
