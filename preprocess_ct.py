@@ -90,7 +90,7 @@ def get_physical_point_from_dicom(
     raise FileNotFoundError(f"Could not find DICOM slice with SOPInstanceUID {sop_uid} in {dicom_folder_path}")
 
 
-def correct_hu_value_if_peak_not_at_zero(data, sigma=7, prominence=1, num_peaks=3, tolerance=50):
+def correct_hu_value_if_peak_not_at_zero(data, sigma=7, prominence=1, num_peaks=3, tolerance=100):
     if not isinstance(data, np.ndarray) or data.size == 0:
         print("Warning: Input data is empty or not a numpy array.")
         return False
@@ -286,6 +286,7 @@ def preprocess_cta_scan(
     target_spacing: tuple = (0.58, 0.58, 1.2),
     cta_hu_window: tuple = (-200, 500),
     initial_coords_list: Optional[List[dict]] = None,
+    sof_tissue_peak_tolerance = 100,
     DEBUG_MODE: bool = False
 ) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[dict]]]: # MODIFIED: Return type
 
