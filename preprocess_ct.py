@@ -166,38 +166,67 @@ def load_dicom_series_manually(dicom_folder_path: str) -> sitk.Image:
     reader = sitk.ImageSeriesReader()
     dicom_names = reader.GetGDCMSeriesFileNames(dicom_folder_path)
     if not dicom_names: raise FileNotFoundError(f"No DICOM series found in directory: {dicom_folder_path}")
+    
     slices = [pydicom.dcmread(dcm, stop_before_pixels=False) for dcm in dicom_names]
     slices_with_pixels = [s for s in slices if hasattr(s, 'pixel_array') and hasattr(s, 'ImagePositionPatient')]
+    
     if not slices_with_pixels: raise ValueError(f"No readable slices with pixel data found in {dicom_folder_path}")
+    
     slice_shapes = [s.pixel_array.shape for s in slices_with_pixels]
     most_common_shape = collections.Counter(slice_shapes).most_common(1)[0][0]
     uniform_slices = [s for s in slices_with_pixels if s.pixel_array.shape == most_common_shape]
+    
     if len(uniform_slices) < len(slices): print(f"Warning: Discarded {len(slices) - len(uniform_slices)} slices with inconsistent shapes from series in {dicom_folder_path}.")
+    
     spatially_unique_slices_dict = {}
     for s in uniform_slices:
         position = tuple(s.ImagePositionPatient)
         if position not in spatially_unique_slices_dict: spatially_unique_slices_dict[position] = s
+        
     unique_slices = list(spatially_unique_slices_dict.values())
+    
     if len(unique_slices) < len(uniform_slices): print(f"Warning: Discarded {len(uniform_slices) - len(uniform_slices)} spatially duplicate slices.")
     if len(unique_slices) < 2: raise RuntimeError(f"Series in {dicom_folder_path} has fewer than 2 unique slices, cannot form a volume.")
-    try: unique_slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
-    except (AttributeError, KeyError): unique_slices.sort(key=lambda x: int(x.InstanceNumber))
+    
+    # Sort the slices to be in the correct anatomical order (Inferior to Superior)
+    try: 
+        unique_slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+    except (AttributeError, KeyError): 
+        unique_slices.sort(key=lambda x: int(x.InstanceNumber))
+
+    # --- START OF NEW LOGIC ---
+    # If the series has more than 200 slices, truncate it to keep only the top 200.
+    # This is done AFTER sorting, so we are selecting the slices corresponding to the head.
+    if len(unique_slices) > 200:
+        print(f"Warning: Series has {len(unique_slices)} slices. Truncating to the top 200 slices (assumed to be the head).")
+        # Slicing with [-200:] selects the last 200 items from the list.
+        unique_slices = unique_slices[-200:]
+    # --- END OF NEW LOGIC ---
+
     unique_slices = filter_bad_slices(unique_slices)
     hu_slices = [robust_hu_conversion(s) for s in unique_slices]
     image_3d_np = np.stack(hu_slices, axis=0)
     image_itk = sitk.GetImageFromArray(image_3d_np)
+    
     first_slice = unique_slices[0]
     pixel_spacing = first_slice.PixelSpacing
     slice_positions = [s.ImagePositionPatient[2] for s in unique_slices]
+    
+    # Recalculate z-spacing based on the (potentially truncated) list of slices
     z_spacing = np.median(np.diff(sorted(slice_positions)))
-    if z_spacing == 0:
-        print(f"Warning: Calculated z-spacing is still zero for {dicom_folder_path}. Falling back to SliceThickness.")
+    if z_spacing == 0 or np.isnan(z_spacing):
+        print(f"Warning: Calculated z-spacing is zero/NaN for {dicom_folder_path}. Falling back to SliceThickness.")
         z_spacing = first_slice.SliceThickness if 'SliceThickness' in first_slice else 1.0
+        
     image_itk.SetSpacing((float(pixel_spacing[0]), float(pixel_spacing[1]), float(z_spacing)))
     image_itk.SetOrigin(first_slice.ImagePositionPatient)
+    
     orientation = first_slice.ImageOrientationPatient
-    row_cosines = [float(o) for o in orientation[0:3]]; col_cosines = [float(o) for o in orientation[3:6]]; z_dir = np.cross(row_cosines, col_cosines)
+    row_cosines = [float(o) for o in orientation[0:3]]
+    col_cosines = [float(o) for o in orientation[3:6]]
+    z_dir = np.cross(row_cosines, col_cosines)
     image_itk.SetDirection((*row_cosines, *col_cosines, *z_dir))
+    
     return image_itk
 
 def load_and_reorient_dicom(dicom_folder_path: str) -> sitk.Image:
