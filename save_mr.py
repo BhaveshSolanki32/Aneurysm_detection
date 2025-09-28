@@ -20,7 +20,7 @@ CSV_LOG_PATH = os.path.join(OUTPUT_DIR, 'preprocessing_log_mra.csv')
 NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'new_localization_mra.csv')
 
 # --- NEW CONFIGURATION OPTIONS ---
-MAX_SCANS_TO_PROCESS = 60
+MAX_SCANS_TO_PROCESS = 100
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv'
 NUM_PROCESSES = 4
 
@@ -144,15 +144,42 @@ if __name__ == '__main__':
         print(f"Error reading CSV files: {e}")
         exit()
     
-    print(f"Starting preprocessing with {NUM_PROCESSES} parallel processes...")
+    print(f"Starting preprocessing with {NUM_PROCESSES} parallel processes (DEBUG MODE)...")
+    print("This will hang on the problematic file, and the last printed UID will be the culprit.")
 
     results = []
     with Pool(processes=NUM_PROCESSES) as pool:
-        for result in tqdm(pool.imap_unordered(process_and_save_scan, tasks), total=len(tasks)):
-            results.append(result)
+        # Create a list of asynchronous jobs
+        async_results = []
+        for task in tasks:
+            series_uid = task[0]
+            # We print the UID BEFORE we give the job to a worker
+            print(f"Submitting task for UID: {series_uid}")
+            job = pool.apply_async(process_and_save_scan, args=(task,))
+            async_results.append((series_uid, job))
 
-    print("\nPreprocessing complete. Generating log and new localization files...")
-    
+        # Use tqdm to wait for jobs to complete
+        for series_uid, job in tqdm(async_results, total=len(tasks), desc="Waiting for workers"):
+            try:
+                # Set a timeout. If a worker is stuck, this will raise an error.
+                # 10 minutes (600 seconds) should be more than enough for any single scan.
+                result = job.get(timeout=600) 
+                results.append(result)
+            except Exception as e:
+                # This is the crucial part. If a job times out or crashes, we catch it.
+                print(f"\n---!!! HANG DETECTED OR ERROR OCCURRED !!! ---")
+                print(f"The process is stuck or failed on SeriesInstanceUID: {series_uid}")
+                print(f"Error: {e}")
+                print(f"This is your 'poison pill' scan.")
+                print(f"---------------------------------------------")
+                # We can optionally append a failure record and continue
+                results.append({
+                    'SeriesInstanceUID': series_uid, 'status': 'Failed_Hang',
+                    'shape_z_y_x': None, 'error': str(e),
+                    'final_coords_zyx': None
+                })
+
+    print("\nPreprocessing complete. Generating log and new localization files...")    
     results_df = pd.DataFrame(results)
     results_df = results_df.sort_values(by='SeriesInstanceUID').reset_index(drop=True)
     
@@ -168,6 +195,7 @@ if __name__ == '__main__':
         (results_df['final_coords_zyx'].notna()) &
         (results_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))
     ].copy()
+    location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
 
     if not loc_df.empty:
         # Explode the list of dictionaries into separate rows
@@ -185,7 +213,6 @@ if __name__ == '__main__':
         
         # One-Hot Encoding Logic
         final_loc_df['Aneurysm Present'] = 1
-        location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
         
         location_dummies = pd.get_dummies(final_loc_df['location'])
         for col in location_cols:

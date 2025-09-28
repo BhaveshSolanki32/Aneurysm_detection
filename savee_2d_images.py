@@ -7,7 +7,7 @@ import concurrent.futures
 import tqdm
 
 # --- Configuration ---
-# 1. Set the path to your folder containing .nii.gz files
+# 1. Set the path to your folder containing .ython saveenii.gz files
 INPUT_FOLDER = Path("processed_data_mra_v1") 
 
 # 2. Set the path for the output images

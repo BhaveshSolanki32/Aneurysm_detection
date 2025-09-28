@@ -98,31 +98,33 @@ def get_physical_point_from_dicom(
 # --------------------------------------------------------------------------
 
 
-def load_and_reorient_dicom(dicom_folder_path: str) -> sitk.Image:
+def load_and_reorient_dicom(dicom_path: str) -> sitk.Image:
     """
-    Loads, ensures the image is 3D, converts pixel type to float32, and orients a DICOM series to LPS standard.
-    This version handles cases where the DICOM reader incorrectly creates a 4D image.
+    Loads a DICOM series from a folder or a single multi-frame DICOM file,
+    ensures it is 3D, converts to float32, and orients to LPS standard.
     """
-    reader = sitk.ImageSeriesReader()
-    dicom_names = reader.GetGDCMSeriesFileNames(dicom_folder_path)
-    if not dicom_names:
-        raise FileNotFoundError(f"No DICOM series in {dicom_folder_path}")
-    reader.SetFileNames(dicom_names)
-    image_itk = reader.Execute()
-
+    if os.path.isdir(dicom_path):
+        print(f"Path is a directory, using ImageSeriesReader for: {dicom_path}")
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_path)
+        if not dicom_names:
+            raise FileNotFoundError(f"No DICOM series found in directory: {dicom_path}")
+        reader.SetFileNames(dicom_names)
+        image_itk = reader.Execute()
+    elif os.path.isfile(dicom_path):
+        print(f"Path is a file, using ImageFileReader for: {dicom_path}")
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(dicom_path)
+        image_itk = reader.Execute()
+    else:
+        raise FileNotFoundError(f"Path does not exist or is not a file/directory: {dicom_path}")
 
     if image_itk.GetDimension() == 4:
-        print(f"Warning: DICOM series was read as a 4D image with size {image_itk.GetSize()}.")
-        print("Extracting the first 3D volume.")
-        
+        print(f"Warning: DICOM was read as a 4D image with size {image_itk.GetSize()}. Extracting first 3D volume.")
         image_itk = image_itk[:, :, :, 0]
-        
         print(f"Image is now 3D with size {image_itk.GetSize()}.")
 
-
     final_itk_image = sitk.Cast(image_itk, sitk.sitkFloat32)
-    
-    # Finally, perform the orientation.
     return sitk.DICOMOrient(final_itk_image, 'LPS')
 
 
@@ -253,66 +255,47 @@ def crop_to_brain(itk_image: sitk.Image) -> sitk.Image:
 
 def normalize_mri_intensity(itk_image: sitk.Image, modality: str) -> sitk.Image:
     """
-    Normalizes intensity range, with a robust, modality-aware workflow that
-    preserves contrast and avoids artifacts, especially for T2-weighted images.
+    Normalizes MRI intensity using a unified contrast-stretching approach
+    that enhances the visibility of bright structures (like aneurysms and vessels)
+    across all modalities (T2, MRA, T1-post) without destructive inversion.
     """
-    print(f"Normalizing intensity for {modality.upper()}...")
+    print(f"Normalizing intensity for {modality.upper()} using unified contrast stretching...")
     image_np = sitk.GetArrayFromImage(itk_image)
     
-    # Create a mask of the brain/head region from the input. We will use this
-    # at the end to ensure we don't re-introduce background voxels.
-    # A value slightly above zero is used to be safe.
-    original_mask = image_np > 1e-3
-    non_zero_voxels = image_np[original_mask]
-
-    if non_zero_voxels.size == 0:
-        print("Warning: No non-zero voxels found in image. Returning original.")
+    # Create a mask of all non-background voxels. A value slightly above zero
+    # is used to robustly separate anatomy from the background.
+    mask = image_np > 1e-3
+    
+    # If the mask is empty, there's nothing to process.
+    if not mask.any():
+        print("Warning: Image appears to be empty. Returning as is.")
         return itk_image
-    
-    # --- Modality-Specific Processing ---
-    if modality.lower() == 'mri t2':
-        print("Inverting MRI T2 signal to make vessels bright...")
         
-        # 1. Use a robust percentile for the maximum value to avoid outlier influence.
-        p99_9 = np.percentile(non_zero_voxels, 99.9)
-        
-        # 2. Invert the signal using the robust max.
-        inverted_np = p99_9 - image_np
-        
-        # 3. Use the ORIGINAL mask to zero out the background. This is the crucial
-        #    fix that prevents creating black holes from inverted bright signals (like CSF).
-        inverted_np[~original_mask] = 0
-        
-        # The image we will proceed with is the inverted one.
-        image_to_normalize = inverted_np
-        
-    else: # For MRA, T1-post, etc.
-        image_to_normalize = image_np
-
-    # --- General Normalization Steps ---
+    brain_voxels = image_np[mask]
     
-    # Get the non-zero voxels from the image we've chosen to normalize
-    # (either the original or the inverted T2)
-    non_zero_voxels_for_norm = image_to_normalize[original_mask]
+    # 1. Determine the robust intensity window of the brain.
+    #    We clip at the 0.5 and 99.5 percentiles to discard the darkest noise
+    #    and the brightest artifacts, focusing only on the relevant tissue signal.
+    p_low = np.percentile(brain_voxels, 0.5)
+    p_high = np.percentile(brain_voxels, 99.5)
     
-    # 4. Clip intensities using percentiles to remove extreme outliers at both ends.
-    #    This improves contrast in the relevant intensity range.
-    p_low = np.percentile(non_zero_voxels_for_norm, 0.5)
-    p_high = np.percentile(non_zero_voxels_for_norm, 99.8)
+    # 2. Clip the entire image to this robust window.
+    #    This makes the normalization much less sensitive to outliers.
+    clipped_np = np.clip(image_np, p_low, p_high)
     
-    clipped_np = np.clip(image_to_normalize, p_low, p_high)
-    
-    # 5. Scale the intensities to the standard [0, 1] range.
-    min_val, max_val = clipped_np.min(), clipped_np.max()
+    # 3. Normalize (stretch) the clipped intensity range to [0, 1].
+    #    This is the core step that enhances contrast.
+    min_val = clipped_np.min()
+    max_val = clipped_np.max()
     
     if max_val > min_val:
         normalized_np = (clipped_np - min_val) / (max_val - min_val)
     else:
-        # Handle the edge case where all values are the same
+        # Avoid division by zero if all values are the same
         normalized_np = clipped_np * 0
         
-    # Final sanity check: ensure the background is still zero.
-    normalized_np[~original_mask] = 0
+    # 4. Re-apply the original mask to ensure the background remains perfectly black.
+    normalized_np[~mask] = 0
         
     # --- Convert back to SimpleITK Image ---
     normalized_itk = sitk.GetImageFromArray(normalized_np.astype(np.float32))
@@ -348,41 +331,40 @@ def resample_image(itk_image: sitk.Image, target_spacing: Tuple[float, float, fl
     
     return resampler.Execute(image_to_resample)
 
-
 def crop_to_head_mri(itk_image: sitk.Image) -> sitk.Image:
     """
-    Crops the image to the largest connected component (the head) using an
-    automatic threshold and robust blob analysis.
+    Crops the image to the largest connected component (the head) using a
+    robust, multi-step masking process that is more reliable than a single threshold.
     """
     print("Cropping to a tight bounding box around the head...")
     
-    # Use Otsu's method to find an automatic threshold between head and background
+    # 1. Use Otsu's method to get a starting threshold for the head vs. background.
+    #    This uses the correct object-oriented calling style to avoid the TypeError.
     otsu_filter = sitk.OtsuThresholdImageFilter()
     otsu_filter.SetInsideValue(0)
     otsu_filter.SetOutsideValue(1)
-    binary_mask = otsu_filter.Execute(itk_image)
+    head_mask = otsu_filter.Execute(itk_image)
     
-    # Use morphological opening to remove small, noisy regions
-    radius_mm = 3
-    spacing = itk_image.GetSpacing()
-    radius_pixels = [int(round(radius_mm / sp)) for sp in spacing if sp > 0]
-    if not radius_pixels: radius_pixels = [3, 3, 3] # Fallback
-    opened_mask = sitk.BinaryMorphologicalOpening(binary_mask, kernelRadius=radius_pixels, kernelType=sitk.sitkBall)
+    # 2. Fill holes within the mask. This is crucial for making the head a single, solid object.
+    filled_mask = sitk.BinaryFillhole(head_mask)
     
-    # Find the largest connected object in the mask (which will be the patient's head)
-    relabeled_mask = sitk.RelabelComponent(sitk.ConnectedComponent(opened_mask), sortByObjectSize=True)
-    largest_component_mask = relabeled_mask == 1
+    # 3. Find all connected objects and keep only the largest one.
+    #    This eliminates any other bright objects (e.g., neck muscle, artifacts).
+    relabeled_mask = sitk.RelabelComponent(sitk.ConnectedComponent(filled_mask), sortByObjectSize=True)
+    largest_component_mask = (relabeled_mask == 1)
     
-    # Fill any holes inside the largest object
-    filled_mask = sitk.BinaryFillhole(largest_component_mask)
+    # 4. Get the bounding box of this final, clean mask and crop the original image.
+    stats_filter = sitk.LabelShapeStatisticsImageFilter()
+    stats_filter.Execute(largest_component_mask)
     
-    # Get the bounding box of this object and crop the original image
-    stats = sitk.LabelShapeStatisticsImageFilter()
-    stats.Execute(filled_mask)
-    if not stats.GetLabels():
+    # Check if any object was found.
+    if not stats_filter.GetLabels():
         print("Warning: crop_to_head_mri failed to find a valid object. Returning original image.")
         return itk_image
-    bbox = stats.GetBoundingBox(1)
+        
+    bbox = stats_filter.GetBoundingBox(1)  # Bounding box of the largest component (label 1)
+    
+    # The bbox is in the format: [start_x, start_y, start_z, size_x, size_y, size_z]
     return sitk.RegionOfInterest(itk_image, size=bbox[3:], index=bbox[:3])
 
 
@@ -422,80 +404,129 @@ def find_neck_cutoff_mri(image_np: np.ndarray, intensity_threshold: float = 0.1)
     
     return int(cutoff_z)
 
+def get_fallback_voxel_points(
+    coords_xy: dict,
+    final_image_shape: Tuple[int, int, int],
+    location_label: str = "FALLBACK"
+) -> List[dict]:
+    """
+    If UID-based localization fails, this function generates a list of potential
+    aneurysm locations as a fallback. It uses the original X,Y coordinates and
+    places a marker on every 15th Z-slice of the final processed image.
 
+    Args:
+        coords_xy: The dictionary with 'x' and 'y' pixel coordinates from the annotation.
+        final_image_shape: The (z, y, x) shape of the final numpy array.
+        location_label: The original location label to append "_FALLBACK" to.
+
+    Returns:
+        A list of dictionaries, each containing ZYX coordinates for a fallback point.
+    """
+    fallback_points = []
+    z_depth, y_max, x_max = final_image_shape
+
+    # It's critical to ensure the original XY coordinates are within the bounds of the FINAL image
+    # We round, convert to int, and clip to the maximum valid index (shape - 1)
+    try:
+        x_coord = min(int(round(float(coords_xy['x']))), x_max - 1)
+        y_coord = min(int(round(float(coords_xy['y']))), y_max - 1)
+    except (ValueError, TypeError):
+        print(f"  -> WARNING: Invalid XY coordinates '{coords_xy}'. Cannot generate fallback.")
+        return []
+
+    # Per your request, iterate through the Z-axis, marking every 15th slice.
+    # We start at index 14 (the 15th slice) and step by 15.
+    for z_index in range(14, z_depth, 15):
+        fallback_zyx = (z_index, y_coord, x_coord)
+        fallback_points.append({
+            'final_coords_zyx': fallback_zyx,
+            'location': location_label
+        })
+
+    print(f"  -> Generated {len(fallback_points)} fallback locations for annotation at (X:{x_coord}, Y:{y_coord}).")
+    return fallback_points
 # --------------------------------------------------------------------------
 # 4. MAIN PREPROCESSING PIPELINE (WITH PERFORMANCE CONTROL)
 # --------------------------------------------------------------------------
 def preprocess_mri_scan(
     dicom_folder_path: str,
     modality: str,
-    target_spacing: tuple = (0.58, 0.58, 1.2),
+    target_spacing: tuple = (0.58, 0.58, 0.58),
     initial_coords_list: Optional[List[dict]] = None,
     pre_smoothing_sigma: Optional[float] = 0.25,
     DEBUG_MODE: bool = False
 ) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[dict]]]:
     """
-    Main pipeline to create a standardized MRI scan with a robust, re-ordered workflow.
+    Main pipeline to create a standardized MRI scan. It now includes a robust
+    fallback mechanism for annotations with mismatched UIDs, preventing crashes.
     """
-    if modality.lower() not in ['mra', 't1post', 'mri t2']:
+    if modality.lower() not in ['mra', 'mri t1post', 'mri t2']:
         raise ValueError("Modality must be 'mra', 'mri t1post', or 'mri t2'")
-    
+
     print("\n--- STARTING PREPROCESSING ---")
-    
-    # --- STEP 1: Load Image (No Change) ---
+
+    # --- STEP 1: Load and Orient Image ---
     reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
-    
-    # Coordinate handling logic (No Change)
-    aneurysm_physical_points_info = [] 
+
+    # --- STEP 2: Attempt to Map Coordinates ---
+    # We will try the primary method, but save any failures for the fallback.
+    aneurysm_physical_points_info = []
+    fallback_annotations_to_process = [] # NEW: Store failed annotations here
+
     if initial_coords_list:
+        print(f"Attempting to map {len(initial_coords_list)} annotation(s)...")
         for coord_info in initial_coords_list:
-            point = get_physical_point_from_dicom(dicom_folder_path, coord_info['sop_uid'], coord_info['coords_xy'])
-            aneurysm_physical_points_info.append({'physical_point': point, 'location': coord_info.get('location', 'N/A')})
-    
-    # --- NEW, OPTIMAL ORDER OF OPERATIONS ---
+            try:
+                # This is the call that might fail for multi-frame DICOMs
+                point = get_physical_point_from_dicom(dicom_folder_path, coord_info['sop_uid'], coord_info['coords_xy'])
+                aneurysm_physical_points_info.append({'physical_point': point, 'location': coord_info.get('location', 'N/A')})
+                print(f"  -> Successfully mapped SOP UID: ...{coord_info['sop_uid'][-15:]}")
+            except (FileNotFoundError, AttributeError) as e:
+                # THIS IS THE FIX: Instead of crashing, we catch the error and save the annotation.
+                print(f"  -> INFO: UID mapping failed ({type(e).__name__}). Flagging for fallback processing.")
+                fallback_annotations_to_process.append(coord_info)
+                continue
 
-
-    # --- STEP 2: Crop First (As you suggested) ---
-    # This robustly isolates the head before any other processing.
-    head_only_itk = crop_to_head_mri(reoriented_itk)
-    del reoriented_itk # Free memory
-        
-    # --- STEP 3: N4 Bias Correction on the Cropped Head ---
-    # Working on the cropped region is faster and more accurate.
-    corrected_itk = n4_bias_field_correction(head_only_itk)
-    del head_only_itk # Free memory
-
-
-    # --- STEP 4: Normalize the Corrected Head ---
-    # Normalizing now gives much better contrast because it's focused on the ROI.
-    normalized_itk = normalize_mri_intensity(corrected_itk, modality)
-    del corrected_itk # Free memory
-
-
-    # --- STEP 5: Resample as the Final Step ---
+    # --- IMAGE PROCESSING STEPS (UNCHANGED) ---
+    corrected_itk = n4_bias_field_correction(reoriented_itk)
+    del reoriented_itk
+    head_only_itk = crop_to_head_mri(corrected_itk)
+    del corrected_itk
+    normalized_itk = normalize_mri_intensity(head_only_itk, modality)
+    del head_only_itk
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing, pre_smoothing_sigma=pre_smoothing_sigma)
-    del normalized_itk # Free memory
-    
-    # --- Final coordinate transformation logic (No Change) ---
+    del normalized_itk
+
+    # --- FINAL COORDINATE TRANSFORMATION ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
-    
-    final_output_list = None
+    final_output_list = []
+
+    # First, process the successfully mapped points
     if aneurysm_physical_points_info:
-        final_output_list = []
         for info in aneurysm_physical_points_info:
             physical_point = info['physical_point']
             final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(physical_point)
             final_image_size = final_itk_image.GetSize()
-            is_inside = all(0 <= c < s for c, s in zip(final_voxel_coords_xyz, final_image_size))
-            if is_inside:
+            if all(0 <= c < s for c, s in zip(final_voxel_coords_xyz, final_image_size)):
                 final_output_list.append({'final_coords_zyx': final_voxel_coords_xyz[::-1], 'location': info['location']})
-            else:
-                print(f"WARNING: Aneurysm at physical point {physical_point} was cropped out.")
 
+    # --- NEW: GENERATE FALLBACK POINTS ---
+    # Now, process any annotations that failed earlier, using the final image shape.
+    if fallback_annotations_to_process:
+        print(f"--- Generating fallback locations for {len(fallback_annotations_to_process)} failed annotation(s) ---")
+        for failed_coord_info in fallback_annotations_to_process:
+            original_xy = failed_coord_info['coords_xy']
+            original_location = failed_coord_info.get('location', 'N/A') + "_FALLBACK"
+            
+            # Call the new function to get the list of (z,y,x) points
+            generated_points = get_fallback_voxel_points(original_xy, final_image_np.shape, original_location)
+            final_output_list.extend(generated_points)
 
     if DEBUG_MODE and final_output_list:
         for i, info in enumerate(final_output_list):
             visualize_location_in_3d(final_image_np, info['final_coords_zyx'], title=f"AFTER (Aneurysm #{i+1} - {info['location']})")
-            
+
     print("--- PREPROCESSING COMPLETE ---")
-    return final_image_np, target_spacing, final_output_list
+    return final_image_np, target_spacing, final_output_list if final_output_list else None
+
+

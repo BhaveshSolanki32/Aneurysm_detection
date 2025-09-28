@@ -312,7 +312,7 @@ def align_to_midsagittal_plane(itk_image: sitk.Image) -> Tuple[sitk.Image, sitk.
 
 def preprocess_cta_scan(
     dicom_folder_path: str,
-    target_spacing: tuple = (0.58, 0.58, 1.2),
+    target_spacing: tuple = (0.58, 0.58, 0.58),
     cta_hu_window: tuple = (-200, 500),
     initial_coords_list: Optional[List[dict]] = None,
     sof_tissue_peak_tolerance = 100,
