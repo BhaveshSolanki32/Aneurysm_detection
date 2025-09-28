@@ -1,93 +1,97 @@
-# Save this as save_mra.py
+# Save this as save_mra_hdf5_fix.py
 import os
 import pandas as pd
 import SimpleITK as sitk
 import numpy as np
-from multiprocessing import Pool, cpu_count
+# --- MODIFIED: Import Manager from multiprocessing ---
+from multiprocessing import Pool, cpu_count, Manager
 from tqdm import tqdm
-import ast # To safely evaluate the string representation of the dictionary
+import ast
+import h5py
 
-# IMPORTANT: Make sure your MRA preprocessing script is in the same directory
-# This assumes you are using a preprocess_mr.py that accepts and returns location data
 from prep_mr import preprocess_mri_scan 
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(2)
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (Identical to before) ---
 BASE_PATH = r'rsna-intracranial-aneurysm-detection\series'
-# --- It's highly recommended to use a new output directory for a fresh run ---
-OUTPUT_DIR = r'processed_data_mra_v1' 
-CSV_LOG_PATH = os.path.join(OUTPUT_DIR, 'preprocessing_log_mra.csv')
-NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'new_localization_mra.csv')
+OUTPUT_HDF5_PATH = os.path.join('processed_data_mra_v1', 'processed_data_mra_v1.hdf5')
+CHUNK_SHAPE = (32, 32, 32) 
+CSV_LOG_PATH = os.path.join('processed_data_mra_v1', 'preprocessing_log_mra.csv')
+NEW_LOCALIZATION_CSV_PATH = os.path.join('processed_data_mra_v1', 'new_localization_mra.csv')
+OUTPUT_DIR_FOR_CSVS = 'processed_data_mra_v1'
 
-# --- NEW CONFIGURATION OPTIONS ---
-MAX_SCANS_TO_PROCESS = 100
+MAX_SCANS_TO_PROCESS = 60
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv'
-NUM_PROCESSES = 4
+NUM_PROCESSES = 8
 
+import time # Add the time import for sleeping
 
 def process_and_save_scan(args):
     """
-    A wrapper function for a single scan. Takes a tuple of arguments.
-    This function will be called by each parallel process.
+    MODIFIED: This version uses a robust file-based lock to prevent write collisions.
     """
-    # MODIFIED: Unpack the new `coords_list` and `modality` arguments
-    series_uid, base_path, output_dir, coords_list, modality = args
+    # NOTE: We no longer need the 'lock' object in the arguments
+    series_uid, base_path, hdf5_path, coords_list, modality = args
     
-    folder_path = os.path.join(base_path, series_uid)
-    output_path = os.path.join(output_dir, f"{series_uid}.nii.gz")
-    
-    if os.path.exists(output_path):
-        return {
-            'SeriesInstanceUID': series_uid, 'status': 'Skipped',
-            'shape_z_y_x': None, 'error': 'File already exists',
-            'final_coords_zyx': None
-        }
+    # Read-only check can still happen without a lock
+    try:
+        with h5py.File(hdf5_path, 'r') as f:
+            if series_uid in f:
+                return {'SeriesInstanceUID': series_uid, 'status': 'Skipped', 'shape_z_y_x': f[series_uid].shape, 'error': 'Dataset already exists in HDF5', 'final_coords_zyx': None}
+    except (FileNotFoundError, OSError):
+        pass
         
     try:
-        # MODIFIED: Pass the list of coordinates and modality to the MRA processing function
+        # --- Heavy processing happens here, in parallel ---
+        folder_path = os.path.join(base_path, series_uid)
         processed_array, final_spacing, final_coords_list = preprocess_mri_scan(
             folder_path,
             modality=modality,
             initial_coords_list=coords_list
         )
-        
         if processed_array.size == 0:
              raise ValueError("Preprocessing returned an empty array.")
+        processed_array_fp16 = processed_array.astype(np.float16)
 
-        sitk_image = sitk.GetImageFromArray(processed_array)
-        sitk_image.SetSpacing(final_spacing[::-1]) 
-        sitk.WriteImage(sitk_image, output_path)
+        # --- BULLETPROOF FILE LOCK IMPLEMENTATION ---
+        lock_file_path = hdf5_path + ".lock"
         
-        # MODIFIED: Return the list of final coordinates
-        return {
-            'SeriesInstanceUID': series_uid, 'status': 'Success',
-            'shape_z_y_x': processed_array.shape, 'error': None,
-            'final_coords_zyx': final_coords_list
-        }
+        while True: # Loop until we acquire the lock
+            try:
+                # O_CREAT | O_EXCL is an atomic "create if not exists" operation
+                fd = os.open(lock_file_path, os.O_CREAT | os.O_EXCL)
+                os.close(fd) # We just needed to create it, not keep it open
+                break # Lock acquired, exit the loop
+            except FileExistsError:
+                time.sleep(0.5) # Lock is held by another process, wait and try again
+
+        try:
+            # --- This section is now guaranteed to only be run by one process at a time ---
+            with h5py.File(hdf5_path, 'a') as f:
+                f.create_dataset(
+                    name=series_uid, data=processed_array_fp16, shape=processed_array_fp16.shape,
+                    dtype='f2', chunks=CHUNK_SHAPE, compression="gzip"
+                )
+        finally:
+            # --- CRITICAL: Always release the lock, even if the write fails ---
+            os.remove(lock_file_path)
+            
+        return {'SeriesInstanceUID': series_uid, 'status': 'Success', 'shape_z_y_x': processed_array.shape, 'error': None, 'final_coords_zyx': final_coords_list}
 
     except Exception as e:
-        return {
-            'SeriesInstanceUID': series_uid, 'status': 'Failed',
-            'shape_z_y_x': None, 'error': str(e),
-            'final_coords_zyx': None
-        }
+        return {'SeriesInstanceUID': series_uid, 'status': 'Failed', 'shape_z_y_x': None, 'error': str(e), 'final_coords_zyx': None}
 
-# This guard is ESSENTIAL for multiprocessing to work correctly
 if __name__ == '__main__':
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR_FOR_CSVS, exist_ok=True)
 
+    # --- NO MORE MANAGER OR LOCK OBJECT NEEDED ---
+    
     try:
         df_train = pd.read_csv(r'rsna-intracranial-aneurysm-detection\train.csv')
         df_loc = pd.read_csv(ORIGINAL_LOCALIZATION_CSV)
         
-        # ---- DATA PREPARATION LOGIC ----
-        # Drop duplicates from train.csv to prevent the N x N join problem
         df_train_unique = df_train.drop_duplicates(subset=['SeriesInstanceUID'])
-
-        # --- Filter for all modalities that are NOT CTA ---
         df_mra = df_train_unique[df_train_unique['Modality'] != 'CTA'].copy()
-        
-        # This merge is now safe because df_mra has unique SeriesInstanceUIDs
         df_merged = pd.merge(df_mra, df_loc, on='SeriesInstanceUID', how='left')
         
         uids_to_process = df_merged['SeriesInstanceUID'].unique().tolist()
@@ -97,45 +101,30 @@ if __name__ == '__main__':
             uids_to_process = uids_to_process[:MAX_SCANS_TO_PROCESS]
             print(f"--- LIMITING to processing {len(uids_to_process)} scans for this run. ---")
             
-        # Group the merged dataframe by series UID to handle multiple aneurysms per series
         grouped = df_merged.groupby('SeriesInstanceUID')
         
         tasks = []
         for uid, group in tqdm(grouped, desc="Preparing tasks"):
-             # We only care about processing UIDs that are in our target list
             if uid not in uids_to_process:
                 continue
             
-            # --- FIX 1: DEFINE MODALITY FOR EVERY GROUP ---
-            # Get the modality from the first row of the group. This ensures it's always defined.
             modality = group['Modality'].iloc[0]
-                
             coords_list_for_series = []
-            # Check if there are any valid localizations for this group
             if not group['SOPInstanceUID'].isnull().all():
                 for _, row in group.iterrows():
-                    # Safely evaluate coordinates
                     try:
                         coords_dict = ast.literal_eval(row['coordinates'])
-                        coords_list_for_series.append({
-                            'sop_uid': row['SOPInstanceUID'],
-                            'coords_xy': coords_dict,
-                            'location': row['location']
-                        })
-                        # --- FIX 2: REMOVE MODALITY ASSIGNMENT FROM HERE ---
-                        # modality = row['Modality'] # This is no longer needed
+                        coords_list_for_series.append({'sop_uid': row['SOPInstanceUID'], 'coords_xy': coords_dict, 'location': row['location']})
                     except (ValueError, SyntaxError, TypeError):
-                        continue # Skip malformed or NaN coordinates
+                        continue
             
-            # If the list is empty after checking all rows, pass None.
-            # Otherwise, pass the populated list.
             final_coords_arg = coords_list_for_series if coords_list_for_series else None
             
-            # This append call will now always work because 'modality' is defined above
+            # --- MODIFIED: The task tuple no longer contains the lock object ---
             tasks.append((
                 uid,
                 BASE_PATH,
-                OUTPUT_DIR,
+                OUTPUT_HDF5_PATH,
                 final_coords_arg,
                 modality
             ))
@@ -144,99 +133,106 @@ if __name__ == '__main__':
         print(f"Error reading CSV files: {e}")
         exit()
     
-    print(f"Starting preprocessing with {NUM_PROCESSES} parallel processes (DEBUG MODE)...")
-    print("This will hang on the problematic file, and the last printed UID will be the culprit.")
-
+    print(f"Starting preprocessing with {NUM_PROCESSES} parallel processes (with Robust File Lock and Hang Detection)...")
+    
     results = []
     with Pool(processes=NUM_PROCESSES) as pool:
-        # Create a list of asynchronous jobs
+        # We are keeping the superior hang-detection logic from the last fix
         async_results = []
         for task in tasks:
             series_uid = task[0]
-            # We print the UID BEFORE we give the job to a worker
-            print(f"Submitting task for UID: {series_uid}")
             job = pool.apply_async(process_and_save_scan, args=(task,))
             async_results.append((series_uid, job))
 
-        # Use tqdm to wait for jobs to complete
-        for series_uid, job in tqdm(async_results, total=len(tasks), desc="Waiting for workers"):
+        for series_uid, job in tqdm(async_results, total=len(tasks), desc="Processing Scans"):
             try:
-                # Set a timeout. If a worker is stuck, this will raise an error.
-                # 10 minutes (600 seconds) should be more than enough for any single scan.
                 result = job.get(timeout=600) 
                 results.append(result)
             except Exception as e:
-                # This is the crucial part. If a job times out or crashes, we catch it.
-                print(f"\n---!!! HANG DETECTED OR ERROR OCCURRED !!! ---")
+                print(f"\n---!!! HANG DETECTED OR CRITICAL ERROR !!! ---")
                 print(f"The process is stuck or failed on SeriesInstanceUID: {series_uid}")
                 print(f"Error: {e}")
-                print(f"This is your 'poison pill' scan.")
                 print(f"---------------------------------------------")
-                # We can optionally append a failure record and continue
-                results.append({
-                    'SeriesInstanceUID': series_uid, 'status': 'Failed_Hang',
-                    'shape_z_y_x': None, 'error': str(e),
-                    'final_coords_zyx': None
-                })
+                results.append({'SeriesInstanceUID': series_uid, 'status': 'Failed_Hang_Or_Error', 'shape_z_y_x': None, 'error': str(e), 'final_coords_zyx': None})
 
+    # --- The rest of the script is unchanged ---
     print("\nPreprocessing complete. Generating log and new localization files...")    
     results_df = pd.DataFrame(results)
     results_df = results_df.sort_values(by='SeriesInstanceUID').reset_index(drop=True)
-    
     log_df = results_df[['SeriesInstanceUID', 'status', 'shape_z_y_x', 'error']]
     log_df.to_csv(CSV_LOG_PATH, index=False)
     print(f"Log file saved to: {CSV_LOG_PATH}")
-
-    # --- CSV SAVING LOGIC (Identical to CTA script) ---
+    # ... (rest of your CSV saving logic)
     
-    # Filter for successful results that actually have coordinate data
-    loc_df = results_df[
-        (results_df['status'] == 'Success') & 
-        (results_df['final_coords_zyx'].notna()) &
-        (results_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))
-    ].copy()
-    location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
+    # --- CSV SAVING LOGIC (This part remains unchanged) ---
+    print("\nGenerating comprehensive localization file for ALL successful scans...")
 
-    if not loc_df.empty:
-        # Explode the list of dictionaries into separate rows
-        loc_df = loc_df.explode('final_coords_zyx')
+    # 1. Start with ALL scans that were successfully processed.
+    all_successful_df = results_df[results_df['status'] == 'Success'].copy()
+
+    # Define the final columns ahead of time for consistency
+    location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
+    final_cols = ['SeriesInstanceUID', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
+
+    # 2. Isolate and process the POSITIVE scans (those with aneurysms)
+    # This is the same logic as before, but applied to a subset
+    positive_df = all_successful_df[
+        (all_successful_df['final_coords_zyx'].notna()) &
+        (all_successful_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))
+    ].copy()
+
+    if not positive_df.empty:
+        positive_df = positive_df.explode('final_coords_zyx')
+        extracted_data = positive_df['final_coords_zyx'].apply(pd.Series)
+        positive_df = positive_df[['SeriesInstanceUID']].join(extracted_data)
         
-        # Convert the column of dictionaries into separate columns ('final_coords_zyx', 'location')
-        extracted_data = loc_df['final_coords_zyx'].apply(pd.Series)
+        coords = pd.DataFrame(positive_df['final_coords_zyx'].tolist(), index=positive_df.index, columns=['coord_z', 'coord_y', 'coord_x'])
+        positive_df = pd.concat([positive_df, coords], axis=1)
         
-        # Use a safe join to combine the SeriesInstanceUID with the new data
-        final_loc_df = loc_df[['SeriesInstanceUID']].join(extracted_data)
+        positive_df['Aneurysm Present'] = 1 # Label these as 1
         
-        # Extract z, y, x coordinates from the tuple into separate columns
-        coords = pd.DataFrame(final_loc_df['final_coords_zyx'].tolist(), index=final_loc_df.index, columns=['coord_z', 'coord_y', 'coord_x'])
-        final_loc_df = pd.concat([final_loc_df, coords], axis=1)
-        
-        # One-Hot Encoding Logic
-        final_loc_df['Aneurysm Present'] = 1
-        
-        location_dummies = pd.get_dummies(final_loc_df['location'])
+        location_dummies = pd.get_dummies(positive_df['location'])
         for col in location_cols:
             if col not in location_dummies.columns:
                 location_dummies[col] = 0
-        
-        # Convert all dummy columns to integers (0 or 1)
         location_dummies = location_dummies[location_cols].astype(int)
                 
-        final_loc_df = pd.concat([final_loc_df, location_dummies], axis=1)
-        
-        # Select and reorder the final columns as requested
-        final_cols = ['SeriesInstanceUID', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
-        final_loc_df = final_loc_df[final_cols]
+        positive_final_df = pd.concat([positive_df, location_dummies], axis=1)
+        positive_final_df = positive_final_df[final_cols]
     else:
-        # Create an empty dataframe with the correct columns if no aneurysms were processed
-        final_cols = ['SeriesInstanceUID', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
-        final_loc_df = pd.DataFrame(columns=final_cols)
+        # If there are no positive scans, create an empty dataframe with the right columns
+        positive_final_df = pd.DataFrame(columns=final_cols)
+
+    # 3. Isolate and process the NEGATIVE scans (no aneurysms)
+    negative_df = all_successful_df[all_successful_df['final_coords_zyx'].isna()].copy()
+    
+    if not negative_df.empty:
+        negative_final_df = negative_df[['SeriesInstanceUID']].copy()
+        negative_final_df['Aneurysm Present'] = 0 # Label these as 0
+    else:
+        negative_final_df = pd.DataFrame(columns=['SeriesInstanceUID', 'Aneurysm Present'])
+
+
+    # 4. Combine the positive and negative dataframes
+    final_loc_df = pd.concat([positive_final_df, negative_final_df], ignore_index=True)
+
+    # 5. Clean up the final dataframe
+    # The artery location columns will be NaN for negative scans, so fill them with 0
+    final_loc_df[location_cols] = final_loc_df[location_cols].fillna(0).astype(int)
+    
+    # Sort by UID for a clean and organized file
+    final_loc_df = final_loc_df.sort_values(by='SeriesInstanceUID').reset_index(drop=True)
+    
     final_loc_df.drop_duplicates(inplace=True)
     final_loc_df.to_csv(NEW_LOCALIZATION_CSV_PATH, index=False)
-    print(f"New localization file saved to: {NEW_LOCALIZATION_CSV_PATH}")
+    print(f"New COMPREHENSIVE localization file saved to: {NEW_LOCALIZATION_CSV_PATH}")
     
     status_counts = results_df['status'].value_counts()
+    aneurysm_counts = final_loc_df['Aneurysm Present'].value_counts()
+    
     print("\n--- Summary ---")
     print(status_counts)
-    print(f"{final_loc_df.shape[0]} aneurysm locations were successfully transformed.")
+    print("\nAneurysm Presence in Final CSV:")
+    print(aneurysm_counts)
+    print(f"A total of {final_loc_df.shape[0]} records were saved.")
     print("-----------------")

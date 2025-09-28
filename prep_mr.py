@@ -516,7 +516,7 @@ def preprocess_mri_scan(
         print(f"--- Generating fallback locations for {len(fallback_annotations_to_process)} failed annotation(s) ---")
         for failed_coord_info in fallback_annotations_to_process:
             original_xy = failed_coord_info['coords_xy']
-            original_location = failed_coord_info.get('location', 'N/A') + "_FALLBACK"
+            original_location = failed_coord_info.get('location', 'N/A')
             
             # Call the new function to get the list of (z,y,x) points
             generated_points = get_fallback_voxel_points(original_xy, final_image_np.shape, original_location)
