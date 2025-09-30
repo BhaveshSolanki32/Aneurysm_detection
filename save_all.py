@@ -25,7 +25,7 @@ NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'localization_manifest.csv'
 
 MAX_SCANS_TO_PROCESS = None # Set to a number (e.g., 100) for testing, or None to run all
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv'
-NUM_PROCESSES = 8 # Adjust based on your CPU cores
+NUM_PROCESSES = 10 # Adjust based on your CPU cores
 
 
 def process_and_save_scan(args):
