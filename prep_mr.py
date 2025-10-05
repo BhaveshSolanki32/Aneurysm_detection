@@ -68,29 +68,82 @@ def visualize_location_in_3d(
     plt.show()
 
 
-def get_physical_point_from_dicom(
-    dicom_folder_path: str, sop_uid: str, coords_xy: dict
+def get_physical_point(
+    dicom_path: str,
+    coord_info: dict
 ) -> Tuple[float, float, float]:
     """
-    Finds a DICOM slice by its SOPInstanceUID and calculates the 3D physical coordinates.
-    This mirrors the logic of the working CTA script.
+    Calculates the 3D physical coordinates from DICOM metadata.
+    CORRECTED: Now properly handles the frame number 'f' when nested inside the 'coords_xy' dictionary.
     """
-    for filename in os.listdir(dicom_folder_path):
-        filepath = os.path.join(dicom_folder_path, filename)
-        if not os.path.isfile(filepath): continue
+    coords_xy = coord_info['coords_xy']
+    x_coord = float(coords_xy['x'])
+    y_coord = float(coords_xy['y'])
+
+    # --- Case 1: Multiframe DICOM with Frame Number 'f' ---
+    # THE FIX IS HERE: Check for 'f' inside the coords_xy dictionary.
+    if 'f' in coords_xy and coords_xy['f'] is not None:
+        frame_number = int(coords_xy['f'])
+        
+        if os.path.isdir(dicom_path):
+            dicom_files = [os.path.join(dicom_path, f) for f in os.listdir(dicom_path) if os.path.isfile(os.path.join(dicom_path, f))]
+            if not dicom_files:
+                raise FileNotFoundError(f"No files found in directory: {dicom_path}")
+            dicom_file_path = max(dicom_files, key=os.path.getsize)
+        else:
+            dicom_file_path = dicom_path
+
+        dcm = pydicom.dcmread(dicom_file_path, stop_before_pixels=True, force=True)
+        
+        frame_index = frame_number - 1
+        if not (hasattr(dcm, 'PerFrameFunctionalGroupsSequence') and 0 <= frame_index < len(dcm.PerFrameFunctionalGroupsSequence)):
+            raise IndexError(f"Frame number {frame_number} is out of bounds for the DICOM.")
+
+        frame_group = dcm.PerFrameFunctionalGroupsSequence[frame_index]
+        shared_group = dcm.SharedFunctionalGroupsSequence[0]
+
+        img_pos_patient = np.array(frame_group.PlanePositionSequence[0].ImagePositionPatient, dtype=float)
+
         try:
-            dcm = pydicom.dcmread(filepath, stop_before_pixels=True, force=True)
-            if hasattr(dcm, 'SOPInstanceUID') and dcm.SOPInstanceUID == sop_uid:
-                img_pos_patient = np.array(dcm.ImagePositionPatient, dtype=float)
-                img_orient_patient = np.array(dcm.ImageOrientationPatient, dtype=float)
-                pixel_spacing = np.array(dcm.PixelSpacing, dtype=float)
-                row_vec = img_orient_patient[3:6]; col_vec = img_orient_patient[0:3]
-                x_coord = float(coords_xy['x']); y_coord = float(coords_xy['y'])
-                physical_coords = img_pos_patient + (x_coord * pixel_spacing[0] * col_vec) + (y_coord * pixel_spacing[1] * row_vec)
-                return tuple(physical_coords)
-        except Exception:
-            continue
-    raise FileNotFoundError(f"Could not find DICOM slice with SOPInstanceUID {sop_uid} in {dicom_folder_path}")
+            img_orient_patient = np.array(frame_group.PlaneOrientationSequence[0].ImageOrientationPatient, dtype=float)
+        except (AttributeError, IndexError):
+            img_orient_patient = np.array(shared_group.PlaneOrientationSequence[0].ImageOrientationPatient, dtype=float)
+        
+        try:
+            pixel_spacing = np.array(frame_group.PixelMeasuresSequence[0].PixelSpacing, dtype=float)
+        except (AttributeError, IndexError):
+            pixel_spacing = np.array(shared_group.PixelMeasuresSequence[0].PixelSpacing, dtype=float)
+        
+        row_vec = img_orient_patient[3:6]
+        col_vec = img_orient_patient[0:3]
+        
+        physical_coords = img_pos_patient + (x_coord * pixel_spacing[0] * col_vec) + (y_coord * pixel_spacing[1] * row_vec)
+        return tuple(physical_coords)
+
+    # --- Case 2: Classic DICOM Series with SOPInstanceUID ---
+    elif 'sop_uid' in coord_info:
+        sop_uid = coord_info['sop_uid']
+        if not os.path.isdir(dicom_path):
+            raise FileNotFoundError(f"A directory path is required for SOP UID lookup, but got a file: {dicom_path}")
+
+        for filename in os.listdir(dicom_path):
+            filepath = os.path.join(dicom_path, filename)
+            if not os.path.isfile(filepath): continue
+            try:
+                dcm = pydicom.dcmread(filepath, stop_before_pixels=True, force=True)
+                if hasattr(dcm, 'SOPInstanceUID') and dcm.SOPInstanceUID == sop_uid:
+                    img_pos_patient = np.array(dcm.ImagePositionPatient, dtype=float)
+                    img_orient_patient = np.array(dcm.ImageOrientationPatient, dtype=float)
+                    pixel_spacing = np.array(dcm.PixelSpacing, dtype=float)
+                    row_vec = img_orient_patient[3:6]; col_vec = img_orient_patient[0:3]
+                    physical_coords = img_pos_patient + (x_coord * pixel_spacing[0] * col_vec) + (y_coord * pixel_spacing[1] * row_vec)
+                    return tuple(physical_coords)
+            except Exception:
+                continue
+        raise FileNotFoundError(f"Could not find DICOM slice with SOPInstanceUID {sop_uid} in {dicom_path}")
+    
+    else:
+        raise KeyError("Coordinate info dictionary is missing a way to locate the slice (neither 'f' in coords_xy nor a top-level 'sop_uid').")
 
 
 # --------------------------------------------------------------------------
@@ -404,47 +457,7 @@ def find_neck_cutoff_mri(image_np: np.ndarray, intensity_threshold: float = 0.1)
     
     return int(cutoff_z)
 
-def get_fallback_voxel_points(
-    coords_xy: dict,
-    final_image_shape: Tuple[int, int, int],
-    location_label: str = "FALLBACK"
-) -> List[dict]:
-    """
-    If UID-based localization fails, this function generates a list of potential
-    aneurysm locations as a fallback. It uses the original X,Y coordinates and
-    places a marker on every 15th Z-slice of the final processed image.
 
-    Args:
-        coords_xy: The dictionary with 'x' and 'y' pixel coordinates from the annotation.
-        final_image_shape: The (z, y, x) shape of the final numpy array.
-        location_label: The original location label to append "_FALLBACK" to.
-
-    Returns:
-        A list of dictionaries, each containing ZYX coordinates for a fallback point.
-    """
-    fallback_points = []
-    z_depth, y_max, x_max = final_image_shape
-
-    # It's critical to ensure the original XY coordinates are within the bounds of the FINAL image
-    # We round, convert to int, and clip to the maximum valid index (shape - 1)
-    try:
-        x_coord = min(int(round(float(coords_xy['x']))), x_max - 1)
-        y_coord = min(int(round(float(coords_xy['y']))), y_max - 1)
-    except (ValueError, TypeError):
-        print(f"  -> WARNING: Invalid XY coordinates '{coords_xy}'. Cannot generate fallback.")
-        return []
-
-    # Per your request, iterate through the Z-axis, marking every 15th slice.
-    # We start at index 14 (the 15th slice) and step by 15.
-    for z_index in range(14, z_depth, 15):
-        fallback_zyx = (z_index, y_coord, x_coord)
-        fallback_points.append({
-            'final_coords_zyx': fallback_zyx,
-            'location': location_label
-        })
-
-    print(f"  -> Generated {len(fallback_points)} fallback locations for annotation at (X:{x_coord}, Y:{y_coord}).")
-    return fallback_points
 # --------------------------------------------------------------------------
 # 4. MAIN PREPROCESSING PIPELINE (WITH PERFORMANCE CONTROL)
 # --------------------------------------------------------------------------
@@ -457,39 +470,76 @@ def preprocess_mri_scan(
     DEBUG_MODE: bool = False
 ) -> Tuple[np.ndarray, Tuple[float, float, float], Optional[List[dict]]]:
     """
-    Main pipeline to create a standardized MRI scan. It now includes a robust
-    fallback mechanism for annotations with mismatched UIDs, preventing crashes.
+    Main pipeline to create a standardized MRI scan.
+    CORRECTED: Implements a robust "transform chain" (Index -> Physical -> Index)
+    to ensure coordinates are perfectly mapped from the raw to the processed volume,
+    solving the geometric inconsistencies common in oblique MR scans.
     """
     if modality.lower() not in ['mra', 'mri t1post', 'mri t2']:
         raise ValueError("Modality must be 'mra', 'mri t1post', or 'mri t2'")
 
     print("\n--- STARTING PREPROCESSING ---")
 
-    # --- STEP 1: Load and Orient Image ---
-    reoriented_itk = load_and_reorient_dicom(dicom_folder_path)
+    # --- STEP 1: Load Initial Image and Establish Coordinate System ---
+    # This image is our "ground truth" for the initial geometry.
+    initial_itk_image = load_and_reorient_dicom(dicom_folder_path)
 
-    # --- STEP 2: Attempt to Map Coordinates ---
-    # We will try the primary method, but save any failures for the fallback.
+    # --- STEP 2: Map Initial Annotations to Physical Space USING the Initial Image ---
     aneurysm_physical_points_info = []
-    fallback_annotations_to_process = [] # NEW: Store failed annotations here
-
     if initial_coords_list:
-        print(f"Attempting to map {len(initial_coords_list)} annotation(s)...")
-        for coord_info in initial_coords_list:
+        print(f"Mapping {len(initial_coords_list)} annotation(s) to physical space...")
+        
+        # We need the UIDs in the exact order SimpleITK loaded them.
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_folder_path)
+        
+        # Handle both multiframe (single file) and series cases
+        if len(dicom_names) == 1: # Multiframe case
+            # For multiframe, Z-index is the frame number.
+            pass 
+        else: # DICOM series case
+            # Create a lookup from UID to its Z-index in the loaded volume
+            uids_in_order = [pydicom.dcmread(f, stop_before_pixels=True, force=True).SOPInstanceUID for f in dicom_names]
+            uid_to_z_index = {uid: i for i, uid in enumerate(uids_in_order)}
+
+        for i, coord_info in enumerate(initial_coords_list):
             try:
-                # This is the call that might fail for multi-frame DICOMs
-                point = get_physical_point_from_dicom(dicom_folder_path, coord_info['sop_uid'], coord_info['coords_xy'])
-                aneurysm_physical_points_info.append({'physical_point': point, 'location': coord_info.get('location', 'N/A')})
-                print(f"  -> Successfully mapped SOP UID: ...{coord_info['sop_uid'][-15:]}")
-            except (FileNotFoundError, AttributeError) as e:
-                # THIS IS THE FIX: Instead of crashing, we catch the error and save the annotation.
-                print(f"  -> INFO: UID mapping failed ({type(e).__name__}). Flagging for fallback processing.")
-                fallback_annotations_to_process.append(coord_info)
+                coords_xy = coord_info['coords_xy']
+                x_idx = float(coords_xy['x'])
+                y_idx = float(coords_xy['y'])
+                z_idx = -1
+
+                # Determine the Z-index of the annotation
+                if 'f' in coords_xy and coords_xy['f'] is not None:
+                    z_idx = int(coords_xy['f']) # Frame numbers are 1-based
+                else:
+                    sop_uid = coord_info['sop_uid']
+                    if sop_uid in uid_to_z_index:
+                        z_idx = uid_to_z_index[sop_uid]
+                
+                if z_idx == -1:
+                    print(f"  -> WARNING: Could not find Z-index for annotation #{i+1}. Skipping.")
+                    continue
+
+                # THE CRUCIAL STEP: Convert the initial (x,y,z) voxel index to a physical point
+                # using the initial image's geometry. We must use integer indices for this.
+                initial_voxel_index = (int(round(x_idx)), int(round(y_idx)), int(z_idx))
+                physical_point = initial_itk_image.TransformIndexToPhysicalPoint(initial_voxel_index)
+                
+                aneurysm_physical_points_info.append({
+                    'physical_point': physical_point,
+                    'location': coord_info.get('location', f'Annotation #{i+1}')
+                })
+                print(f"  -> Successfully mapped annotation #{i+1} to physical point: {physical_point}")
+
+            except Exception as e:
+                print(f"  -> ERROR: Failed to map annotation #{i+1}. Reason: {type(e).__name__}: {e}. Skipping.")
                 continue
 
-    # --- IMAGE PROCESSING STEPS (UNCHANGED) ---
-    corrected_itk = n4_bias_field_correction(reoriented_itk)
-    del reoriented_itk
+    # --- STEP 3: Perform Image Processing on the Initial Image ---
+    # All subsequent operations are performed on the SimpleITK image object
+    corrected_itk = n4_bias_field_correction(initial_itk_image)
+    del initial_itk_image
     head_only_itk = crop_to_head_mri(corrected_itk)
     del corrected_itk
     normalized_itk = normalize_mri_intensity(head_only_itk, modality)
@@ -497,34 +547,29 @@ def preprocess_mri_scan(
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing, pre_smoothing_sigma=pre_smoothing_sigma)
     del normalized_itk
 
-    # --- FINAL COORDINATE TRANSFORMATION ---
+    # --- STEP 4: Transform Physical Points to Final Voxel Coordinates ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
     final_output_list = []
 
-    # First, process the successfully mapped points
     if aneurysm_physical_points_info:
+        print("Transforming physical points to final voxel space...")
         for info in aneurysm_physical_points_info:
             physical_point = info['physical_point']
+            
+            # THE FINAL STEP: Convert the physical point to a voxel index in the FINAL image
             final_voxel_coords_xyz = final_itk_image.TransformPhysicalPointToIndex(physical_point)
+            
+            # Check if the coordinate is within the bounds of the final image
             final_image_size = final_itk_image.GetSize()
             if all(0 <= c < s for c, s in zip(final_voxel_coords_xyz, final_image_size)):
+                # SimpleITK returns (x,y,z), but NumPy needs (z,y,x)
                 final_output_list.append({'final_coords_zyx': final_voxel_coords_xyz[::-1], 'location': info['location']})
-
-    # --- NEW: GENERATE FALLBACK POINTS ---
-    # Now, process any annotations that failed earlier, using the final image shape.
-    if fallback_annotations_to_process:
-        print(f"--- Generating fallback locations for {len(fallback_annotations_to_process)} failed annotation(s) ---")
-        for failed_coord_info in fallback_annotations_to_process:
-            original_xy = failed_coord_info['coords_xy']
-            original_location = failed_coord_info.get('location', 'N/A')
-            
-            # Call the new function to get the list of (z,y,x) points
-            generated_points = get_fallback_voxel_points(original_xy, final_image_np.shape, original_location)
-            final_output_list.extend(generated_points)
+            else:
+                print(f"  -> WARNING: Transformed coordinate {final_voxel_coords_xyz} is outside the final image bounds {final_image_size}. Discarding.")
 
     if DEBUG_MODE and final_output_list:
         for i, info in enumerate(final_output_list):
-            visualize_location_in_3d(final_image_np, info['final_coords_zyx'], title=f"AFTER (Aneurysm #{i+1} - {info['location']})")
+            visualize_location_in_3d(final_image_np, info['final_coords_zyx'], title=f"FINAL MAPPED LOCATION (Aneurysm #{i+1} - {info['location']})")
 
     print("--- PREPROCESSING COMPLETE ---")
     return final_image_np, target_spacing, final_output_list if final_output_list else None

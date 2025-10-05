@@ -26,7 +26,7 @@ NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'localization_manifest.csv'
 MAX_SCANS_TO_PROCESS = None # Set to a number (e.g., 100) for testing, or None to run all
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv'
 NUM_PROCESSES = 10 # Adjust based on your CPU cores
-
+BATCH_SIZE = 100 
 
 def process_and_save_scan(args):
     """
@@ -132,88 +132,116 @@ if __name__ == '__main__':
         print(f"Error reading CSV files: {e}")
         exit()
     
-    print(f"Starting preprocessing with {NUM_PROCESSES} parallel processes...")
-    
-    results = []
-    with Pool(processes=NUM_PROCESSES) as pool:
-        async_results = []
-        for task in tasks:
-            series_uid = task[0]
-            job = pool.apply_async(process_and_save_scan, args=(task,))
-            async_results.append((series_uid, job))
+    # --- BATCHING LOGIC START ---
+    total_tasks = len(tasks)
+    num_batches = (total_tasks + BATCH_SIZE - 1) // BATCH_SIZE # Calculate total number of batches
 
-        for series_uid, job in tqdm(async_results, total=len(tasks), desc="Processing Scans"):
-            try:
-                result = job.get(timeout=600) 
-                results.append(result)
-            except Exception as e:
-                print(f"\n---!!! HANG DETECTED OR CRITICAL ERROR !!! ---")
-                print(f"Process failed on SeriesInstanceUID: {series_uid} | Error: {e}")
-                print(f"---------------------------------------------")
-                results.append({'SeriesInstanceUID': series_uid, 'status': 'Failed_Hang_Or_Error', 'shape_z_y_x': None, 'error': str(e), 'final_coords_zyx': None})
-
-    # --- COMPREHENSIVE CSV SAVING LOGIC (MODIFIED TO INCLUDE MODALITY) ---
-    print("\nPreprocessing complete. Generating comprehensive localization file for ALL successful scans...")
-    results_df = pd.DataFrame(results)
+    print(f"Starting preprocessing of {total_tasks} scans in {num_batches} batches of size {BATCH_SIZE}...")
     
-    # --- CHANGE 1: MERGE WITH ORIGINAL DATAFRAME TO GET MODALITY ---
-    # We use the df_train_unique which has the UID and Modality for every scan.
-    results_df = pd.merge(results_df, df_train_unique[['SeriesInstanceUID', 'Modality']], on='SeriesInstanceUID', how='left')
-    
-    results_df.to_csv(CSV_LOG_PATH, index=False)
-    print(f"Detailed log file saved to: {CSV_LOG_PATH}")
+    for i in range(num_batches):
+        start_index = i * BATCH_SIZE
+        end_index = start_index + BATCH_SIZE
+        batch_tasks = tasks[start_index:end_index]
+        
+        print(f"\n--- Processing Batch {i+1}/{num_batches} ({len(batch_tasks)} scans) ---")
 
-    all_successful_df = results_df[results_df['status'] == 'Success'].copy()
-    location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
-    
-    # --- CHANGE 2: ADD 'Modality' TO THE LIST OF FINAL COLUMNS ---
-    final_cols = ['SeriesInstanceUID', 'Modality', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
+        results = []
+        with Pool(processes=NUM_PROCESSES) as pool:
+            async_results = []
+            for task in batch_tasks:
+                series_uid = task[0]
+                job = pool.apply_async(process_and_save_scan, args=(task,))
+                async_results.append((series_uid, job))
 
-    positive_df = all_successful_df[(all_successful_df['final_coords_zyx'].notna()) & (all_successful_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))].copy()
+            for series_uid, job in tqdm(async_results, total=len(batch_tasks), desc=f"Batch {i+1}/{num_batches}"):
+                try:
+                    result = job.get(timeout=600) 
+                    results.append(result)
+                except Exception as e:
+                    print(f"\n---!!! HANG DETECTED OR CRITICAL ERROR !!! ---")
+                    print(f"Process failed on SeriesInstanceUID: {series_uid} | Error: {e}")
+                    print(f"---------------------------------------------")
+                    results.append({'SeriesInstanceUID': series_uid, 'status': 'Failed_Hang_Or_Error', 'shape_z_y_x': None, 'error': str(e), 'final_coords_zyx': None})
+        
+        # --- COMPREHENSIVE CSV SAVING LOGIC (MODIFIED FOR BATCHING) ---
+        if not results:
+            print("No results in this batch to save. Continuing...")
+            continue
 
-    if not positive_df.empty:
-        positive_df = positive_df.explode('final_coords_zyx')
-        extracted_data = positive_df['final_coords_zyx'].apply(pd.Series)
-        # --- CHANGE 3: CARRY 'Modality' THROUGH THE POSITIVE DATAFRAME ---
-        positive_df = positive_df[['SeriesInstanceUID', 'Modality']].join(extracted_data)
-        coords = pd.DataFrame(positive_df['final_coords_zyx'].tolist(), index=positive_df.index, columns=['coord_z', 'coord_y', 'coord_x'])
-        positive_df = pd.concat([positive_df, coords], axis=1)
-        positive_df['Aneurysm Present'] = 1
-        location_dummies = pd.get_dummies(positive_df['location'])
-        for col in location_cols:
-            if col not in location_dummies.columns:
-                location_dummies[col] = 0
-        location_dummies = location_dummies[location_cols].astype(int)
-        positive_final_df = pd.concat([positive_df, location_dummies], axis=1)
-        positive_final_df = positive_final_df[final_cols]
-    else:
-        positive_final_df = pd.DataFrame(columns=final_cols)
+        print(f"\nBatch {i+1} complete. Appending results to CSVs...")
+        results_df = pd.DataFrame(results)
+        
+        results_df = pd.merge(results_df, df_train_unique[['SeriesInstanceUID', 'Modality']], on='SeriesInstanceUID', how='left')
+        
+        # Append to the log CSV, writing header only for the first batch
+        header = not os.path.exists(CSV_LOG_PATH)
+        results_df.to_csv(CSV_LOG_PATH, mode='a', header=header, index=False)
+        print(f"Detailed log file updated: {CSV_LOG_PATH}")
 
-    negative_df = all_successful_df[all_successful_df['final_coords_zyx'].isna()].copy()
-    # --- CHANGE 4: CARRY 'Modality' THROUGH THE NEGATIVE DATAFRAME ---
-    negative_final_df = negative_df[['SeriesInstanceUID', 'Modality']].copy()
-    negative_final_df['Aneurysm Present'] = 0
+        all_successful_df = results_df[results_df['status'] == 'Success'].copy()
+        
+        if not all_successful_df.empty:
+            location_cols = ['Left Infraclinoid Internal Carotid Artery', 'Right Infraclinoid Internal Carotid Artery', 'Left Supraclinoid Internal Carotid Artery', 'Right Supraclinoid Internal Carotid Artery', 'Left Middle Cerebral Artery', 'Right Middle Cerebral Artery', 'Anterior Communicating Artery', 'Left Anterior Cerebral Artery', 'Right Anterior Cerebral Artery', 'Left Posterior Communicating Artery', 'Right Posterior Communicating Artery', 'Basilar Tip', 'Other Posterior Circulation']
+            final_cols = ['SeriesInstanceUID', 'Modality', 'coord_z', 'coord_y', 'coord_x'] + location_cols + ['Aneurysm Present']
 
-    final_loc_df = pd.concat([positive_final_df, negative_final_df], ignore_index=True)
-    final_loc_df[location_cols] = final_loc_df[location_cols].fillna(0).astype(int)
-    final_loc_df = final_loc_df.sort_values(by='SeriesInstanceUID').reset_index(drop=True)
-    # Ensure the final column order is correct
-    final_loc_df = final_loc_df[final_cols]
+            positive_df = all_successful_df[(all_successful_df['final_coords_zyx'].notna()) & (all_successful_df['final_coords_zyx'].apply(lambda x: isinstance(x, list) and len(x) > 0))].copy()
+
+            if not positive_df.empty:
+                positive_df = positive_df.explode('final_coords_zyx')
+                extracted_data = positive_df['final_coords_zyx'].apply(pd.Series)
+                positive_df = positive_df[['SeriesInstanceUID', 'Modality']].join(extracted_data)
+                coords = pd.DataFrame(positive_df['final_coords_zyx'].tolist(), index=positive_df.index, columns=['coord_z', 'coord_y', 'coord_x'])
+                positive_df = pd.concat([positive_df, coords], axis=1)
+                positive_df['Aneurysm Present'] = 1
+                location_dummies = pd.get_dummies(positive_df['location'])
+                for col in location_cols:
+                    if col not in location_dummies.columns:
+                        location_dummies[col] = 0
+                location_dummies = location_dummies[location_cols].astype(int)
+                positive_final_df = pd.concat([positive_df, location_dummies], axis=1)
+                positive_final_df = positive_final_df[final_cols]
+            else:
+                positive_final_df = pd.DataFrame(columns=final_cols)
+
+            negative_df = all_successful_df[all_successful_df['final_coords_zyx'].isna()].copy()
+            negative_final_df = negative_df[['SeriesInstanceUID', 'Modality']].copy()
+            negative_final_df['Aneurysm Present'] = 0
+
+            batch_final_loc_df = pd.concat([positive_final_df, negative_final_df], ignore_index=True)
+            batch_final_loc_df[location_cols] = batch_final_loc_df[location_cols].fillna(0).astype(int)
+            batch_final_loc_df = batch_final_loc_df.sort_values(by='SeriesInstanceUID').reset_index(drop=True)
+            batch_final_loc_df = batch_final_loc_df[final_cols]
+            
+            # Append to the final manifest CSV, writing header only for the first batch
+            header_loc = not os.path.exists(NEW_LOCALIZATION_CSV_PATH)
+            batch_final_loc_df.to_csv(NEW_LOCALIZATION_CSV_PATH, mode='a', header=header_loc, index=False)
+            print(f"Final training manifest updated: {NEW_LOCALIZATION_CSV_PATH}")
+
+    # --- FINAL SUMMARY (AFTER ALL BATCHES) ---
+    print("\n--- All Batches Complete. Final Summary ---")
     
-    final_loc_df.drop_duplicates(inplace=True)
-    final_loc_df.to_csv(NEW_LOCALIZATION_CSV_PATH, index=False)
-    print(f"Final training manifest saved to: {NEW_LOCALIZATION_CSV_PATH}")
+    # Read the final, consolidated files to give an accurate summary
+    try:
+        final_log_df = pd.read_csv(CSV_LOG_PATH)
+        final_loc_df_summary = pd.read_csv(NEW_LOCALIZATION_CSV_PATH)
+        final_loc_df_summary.drop_duplicates(inplace=True)
+        final_loc_df_summary.to_csv(NEW_LOCALIZATION_CSV_PATH, index=False) # Save the de-duplicated version
+        
+        status_counts = final_log_df['status'].value_counts()
+        aneurysm_counts = final_loc_df_summary['Aneurysm Present'].value_counts()
+        modality_counts = final_loc_df_summary['Modality'].value_counts()
     
-    status_counts = results_df['status'].value_counts()
-    aneurysm_counts = final_loc_df['Aneurysm Present'].value_counts()
-    modality_counts = final_loc_df['Modality'].value_counts()
-    
-    print("\n--- Summary ---")
-    print("Processing Status Counts:")
-    print(status_counts)
-    print("\nModality Counts in Final Manifest:")
-    print(modality_counts)
-    print("\nAneurysm Presence in Final Manifest:")
-    print(aneurysm_counts)
-    print(f"A total of {final_loc_df.shape[0]} records were saved.")
+        print("\nProcessing Status Counts (from full log):")
+        print(status_counts)
+        print("\nModality Counts in Final Manifest:")
+        print(modality_counts)
+        print("\nAneurysm Presence in Final Manifest:")
+        print(aneurysm_counts)
+        print(f"A total of {final_loc_df_summary.shape[0]} unique records were saved.")
+    except FileNotFoundError:
+        print("Could not generate final summary. One or more CSV files were not created.")
+        
     print("-----------------")
+
+
+    
