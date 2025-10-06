@@ -11,17 +11,17 @@ import ast
 
 # --- 1. CONFIGURATION ---
 # Path to your new localization CSV with both positive and negative cases
-LOCALIZATION_CSV_PATH = r'processed_data_unified\all_scan_csv_label.csv' 
+LOCALIZATION_CSV_PATH = r'processed_data_unified\all_scan_csv.csv' 
 # Path to the HDF5 file containing all preprocessed 3D scans
-HDF5_DATA_PATH = r'processed_data_unified\processed_scans.hdf5'
+HDF5_DATA_PATH = r'aneurysm_dataset_manifests_hdf5_ho\processed_scans.hdf5'
 # Directory to save the output manifest CSV files
 OUTPUT_DIR = r'aneurysm_dataset_manifests_hdf5' 
 PATCH_SIZE = 96
-STRIDE = 40
+STRIDE = 64
 # The data will be split into training and testing sets based on this ratio.
 # For example, 0.8 means 80% for training and 20% for testing.
 TRAIN_SIZE = 0.8
-# Using almost all available CPU cores for processing
+# Using almo64st all available CPU cores for processing
 NUM_PROCESSES = max(1, cpu_count() - 2)
 
 # --- 2. HELPER & WORKER FUNCTIONS ---
@@ -174,6 +174,10 @@ if __name__ == '__main__':
     # Ensure correct column order
     ordered_cols = ['SeriesInstanceUID', 'Modality', 'start_z', 'start_y', 'start_x', 
                     'Aneurysm Present', 'relative_coords'] + location_cols
+    print("Number of rows in manifest:", len(df_manifest))
+    print("Columns found in df_manifest:", df_manifest.columns.tolist())
+    print("Expected columns:", ordered_cols)
+
     df_manifest = df_manifest[ordered_cols]
 
     # Perform a patient-level split to ensure no patient data leaks between sets
@@ -200,6 +204,6 @@ if __name__ == '__main__':
             neg_count = len(split_df) - pos_count
             pos_percentage = (pos_count / len(split_df)) * 100 if len(split_df) > 0 else 0
             print(f" -> Contains {pos_count:,} positive patches and {neg_count:,} negative patches ({pos_percentage:.2f}% positive).")
-
+    
     print("\n--- Manifest Creation Complete ---")
     print(f"All manifest files are saved in the '{OUTPUT_DIR}' directory.")

@@ -9,7 +9,7 @@ import tqdm
 
 # --- Configuration ---
 # 1. Set the path to your SINGLE HDF5 file
-HDF5_INPUT_PATH = Path(r"processed_data_unified\processed_scans.hdf5") 
+HDF5_INPUT_PATH = Path(r"aneurysm_dataset_manifests_hdf5_ho\processed_scans.hdf5") 
 
 # 2. Set the path for the output images
 OUTPUT_FOLDER = Path("output_slices_mr_from_hdf5")

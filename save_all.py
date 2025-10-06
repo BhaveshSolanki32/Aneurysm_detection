@@ -25,13 +25,15 @@ NEW_LOCALIZATION_CSV_PATH = os.path.join(OUTPUT_DIR, 'localization_manifest.csv'
 
 MAX_SCANS_TO_PROCESS = None # Set to a number (e.g., 100) for testing, or None to run all
 ORIGINAL_LOCALIZATION_CSV = r'rsna-intracranial-aneurysm-detection\train_localizers.csv'
-NUM_PROCESSES = 10 # Adjust based on your CPU cores
-BATCH_SIZE = 100 
+NUM_PROCESSES = 8 # Adjust based on your CPU cores
+BATCH_SIZE = 500
 
 def process_and_save_scan(args):
     """
     A unified wrapper function that calls the correct preprocessing pipeline
     based on the scan's modality (CTA vs. MRA/other).
+    OPTIMIZED: Includes 'del' statements to explicitly release memory from large
+    NumPy arrays, reducing the memory footprint of each worker process.
     """
     series_uid, base_path, hdf5_path, coords_list, modality = args
     
@@ -63,7 +65,14 @@ def process_and_save_scan(args):
         if processed_array.size == 0:
              raise ValueError("Preprocessing returned an empty array.")
         
+        # Capture shape for the return log before deleting the array
+        final_shape = processed_array.shape
+        
+        # Convert to float16 for storage efficiency
         processed_array_fp16 = processed_array.astype(np.float16)
+
+        # MEMORY OPTIMIZATION: Delete the large, full-precision array now that it's converted.
+        del processed_array
 
         # 3. ROBUST LOCK: Use a file-based lock to prevent write collisions.
         lock_file_path = hdf5_path + ".lock"
@@ -86,7 +95,10 @@ def process_and_save_scan(args):
             # CRITICAL: Always release the lock
             os.remove(lock_file_path)
             
-        return {'SeriesInstanceUID': series_uid, 'status': 'Success', 'shape_z_y_x': processed_array.shape, 'error': None, 'final_coords_zyx': final_coords_list}
+        # MEMORY OPTIMIZATION: Delete the float16 array after it has been written to disk.
+        del processed_array_fp16
+
+        return {'SeriesInstanceUID': series_uid, 'status': 'Success', 'shape_z_y_x': final_shape, 'error': None, 'final_coords_zyx': final_coords_list}
 
     except Exception as e:
         return {'SeriesInstanceUID': series_uid, 'status': 'Failed', 'shape_z_y_x': None, 'error': str(e), 'final_coords_zyx': None}
@@ -242,6 +254,3 @@ if __name__ == '__main__':
         print("Could not generate final summary. One or more CSV files were not created.")
         
     print("-----------------")
-
-
-    

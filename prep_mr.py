@@ -474,6 +474,8 @@ def preprocess_mri_scan(
     CORRECTED: Implements a robust "transform chain" (Index -> Physical -> Index)
     to ensure coordinates are perfectly mapped from the raw to the processed volume,
     solving the geometric inconsistencies common in oblique MR scans.
+    OPTIMIZED: Includes 'del' statements to explicitly release memory from large
+    intermediate image objects, reducing peak RAM usage.
     """
     if modality.lower() not in ['mra', 'mri t1post', 'mri t2']:
         raise ValueError("Modality must be 'mra', 'mri t1post', or 'mri t2'")
@@ -539,13 +541,16 @@ def preprocess_mri_scan(
     # --- STEP 3: Perform Image Processing on the Initial Image ---
     # All subsequent operations are performed on the SimpleITK image object
     corrected_itk = n4_bias_field_correction(initial_itk_image)
-    del initial_itk_image
+    del initial_itk_image  # MEMORY OPTIMIZATION: Release the initial image
+
     head_only_itk = crop_to_head_mri(corrected_itk)
-    del corrected_itk
+    del corrected_itk  # MEMORY OPTIMIZATION: Release the bias-corrected image
+
     normalized_itk = normalize_mri_intensity(head_only_itk, modality)
-    del head_only_itk
+    del head_only_itk  # MEMORY OPTIMIZATION: Release the cropped head image
+
     final_itk_image = resample_image(normalized_itk, target_spacing=target_spacing, pre_smoothing_sigma=pre_smoothing_sigma)
-    del normalized_itk
+    del normalized_itk  # MEMORY OPTIMIZATION: Release the normalized image
 
     # --- STEP 4: Transform Physical Points to Final Voxel Coordinates ---
     final_image_np = sitk.GetArrayFromImage(final_itk_image)
