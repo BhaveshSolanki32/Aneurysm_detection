@@ -335,6 +335,14 @@ The scan-level model uses `AUCMLoss` (from `libauc`) for both aneurysm and arter
 
 > The low patch-level PR AUC reflects extreme class imbalance — the vast majority of patches contain no aneurysm. ROC AUC is the more meaningful patch-level metric.
 
+#### Visualizations
+
+  <img width="1990" height="889" alt="__results___3_7" src="https://github.com/user-attachments/assets/8b25a0e5-7bd9-4fea-872b-d7b2a4839330" />
+  **ROC and PR Curve**
+  
+  <img width="1790" height="690" alt="__results___3_10" src="https://github.com/user-attachments/assets/0c1c98ac-8ef0-4325-82f8-f0fad3f2569b" />
+  **Confusion Matrix & Score Distribution**
+
 ---
 
 ### Phase 3 — Scan-Level Model (864 test scans)
@@ -350,18 +358,13 @@ The scan-level model uses `AUCMLoss` (from `libauc`) for both aneurysm and arter
 
 > The scan-level model shows a large improvement in PR AUC (0.25 → 0.82) by aggregating global context across the full volume. The 0.92 precision at 0.5 threshold indicates that when the model predicts positive, it is very likely correct. Recall can be improved with threshold tuning. Artery localization (mean AUC 0.61) is the harder sub-task, inherently dependent on the detection step being correct first.
 
----
+#### Visualizations
 
-### Visualizations
-
-<!-- Add training history plot here: visualizations/training_history.png -->
-**Training Loss & Score Curves**
-
-<!-- Add ROC and PR curves here: visualizations/roc_pr_curves.png -->
-**ROC and Precision-Recall Curves**
-
-<!-- Add confusion matrix here: visualizations/confusion_matrix_and_distribution.png -->
-**Confusion Matrix & Score Distribution**
+  <img width="1990" height="890" alt="__results___3_3" src="https://github.com/user-attachments/assets/da8123fe-fb71-4b37-b650-55bab7141b20" />
+  **ROC and PR Curve**
+  
+  <img width="1790" height="690" alt="__results___3_5" src="https://github.com/user-attachments/assets/9dd1ba39-ca3a-43d0-9a2c-3d4879b1d069" />
+  **Confusion Matrix & Score Distribution**
 
 ---
 
@@ -379,11 +382,6 @@ Aneurysm_detection/
 ├── patching.py                        # Patch manifest creation (NPY backend)
 ├── patching_hdf5.py                   # Patch manifest creation (HDF5 backend)
 ├── nii_to_npy.py                      # NIfTI to NumPy conversion utility
-│
-├── training-aneurysm-kaggle.ipynb     # Phase 1: Patch-level DDP training
-├── model-data-collection-patch.ipynb  # Phase 2: Embedding extraction
-├── scan-level-model-rsna.ipynb        # Phase 3: Scan-level training
-│
 ├── mra.ipynb                          # MRA data exploration
 ├── train_data.ipynb                   # Training data analysis
 ├── test.ipynb                         # Evaluation / inference notebook
@@ -403,6 +401,10 @@ Aneurysm_detection/
     ├── train_manifest.csv             # Patch-level training set
     └── test_manifest.csv              # Patch-level test set
 ```
+### Kaggle Notebooks:
+  - Patch Level model: https://www.kaggle.com/code/bhaveshsolanki001/training-aneurysm
+  - Patch level embedding generator: https://www.kaggle.com/code/bhaveshsolanki32/model-data-collection-patch
+  - Scan level model: https://www.kaggle.com/code/bhaveshsolanki32/scan-level-model-rsna/notebook
 
 ---
 
