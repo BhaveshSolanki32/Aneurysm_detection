@@ -1,362 +1,247 @@
 # 🧠 Intracranial Aneurysm Detection — RSNA Kaggle Competition
 
-[![Kaggle Competition](https://img.shields.io/badge/Kaggle-RSNA%20Aneurysm%20Detection-blue?logo=kaggle)](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange?logo=pytorch)](https://pytorch.org/)
-[![MONAI](https://img.shields.io/badge/MONAI-Medical%20AI-green)](https://monai.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-> End-to-end deep learning pipeline for detecting and localizing intracranial aneurysms across **multiple imaging modalities** (CTA, MRA, MRI T1post, MRI T2), featuring a two-stage hierarchical architecture: a **patch-level Hybrid SwinUNETR classifier** followed by a **scan-level Hierarchical Transformer** that aggregates patch embeddings across the full 3D volume.
+> A full end-to-end deep learning pipeline for detecting and localizing intracranial aneurysms from multi-modal 3D medical scans (CTA and MRA), built for the [RSNA Intracranial Aneurysm Detection](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection) Kaggle competition.
 
 ---
 
-## Table of Contents
+## 📌 Table of Contents
 
-- [Background & Competition](#background--competition)
-- [Project Journey](#project-journey)
-- [Dataset & Modalities](#dataset--modalities)
-- [Pipeline Overview](#pipeline-overview)
-- [Preprocessing](#preprocessing)
-- [3D Patch Strategy](#3d-patch-strategy)
-- [Model Architecture](#model-architecture)
-  - [Phase 1 — Patch-Level Hybrid Classifier](#phase-1--patch-level-hybrid-classifier)
-  - [Phase 2 — Scan-Level Hierarchical Transformer](#phase-2--scan-level-hierarchical-transformer)
-- [Loss Function](#loss-function)
-- [Training Strategy](#training-strategy)
-- [Results](#results)
-- [Repository Structure](#repository-structure)
-- [Setup & Usage](#setup--usage)
-- [Technologies Used](#technologies-used)
+1. [Project Overview](#project-overview)
+2. [The Challenge](#the-challenge)
+3. [Dataset & Data Exploration](#dataset--data-exploration)
+4. [Data Preprocessing Pipeline](#data-preprocessing-pipeline)
+5. [Patch-Level Model — Stage 1](#patch-level-model--stage-1)
+6. [Scan-Level Model — Stage 2](#scan-level-model--stage-2)
+7. [Training Strategy](#training-strategy)
+8. [Results](#results)
+9. [Repository Structure](#repository-structure)
+10. [Tech Stack](#tech-stack)
+11. [How to Run](#how-to-run)
+12. [Key Design Decisions](#key-design-decisions)
 
 ---
 
-## Background & Competition
+## Project Overview
 
-The [RSNA Intracranial Aneurysm Detection](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection) competition challenged participants to automatically detect and localize intracranial aneurysms — balloon-like bulges in blood vessels in the brain — from medical imaging scans. Undetected aneurysms can rupture, causing life-threatening hemorrhagic stroke.
+Intracranial aneurysms are life-threatening vascular abnormalities — a rupture is fatal in roughly 40% of cases. Yet detection from 3D brain imaging is time-consuming and depends heavily on radiologist experience. This project builds a **two-stage deep learning detection system** that:
 
-The task required:
-- **Binary classification**: Is an aneurysm present?
-- **Multi-label localization**: Which of 13 arterial locations is the aneurysm at? (e.g., Left MCA, Basilar Tip, Anterior Communicating Artery, etc.)
-- Handling of a **highly imbalanced dataset** across heterogeneous imaging modalities.
+1. **Stage 1 (Patch-Level)** — Scans 3D brain volumes in fixed 96³ voxel patches and classifies each patch for aneurysm presence and artery location using a **Hybrid CNN-SwinUNETR** model.
+2. **Stage 2 (Scan-Level)** — Aggregates patch-level embeddings across the full scan via a **hierarchical transformer** (local + global attention) to produce a final scan-level diagnosis.
 
----
-
-## Project Journey
-
-This competition was an intensive deep dive into 3D medical imaging. The focus was not on rushing to a model, but on truly understanding the data first.
-
-**Month 1 — Deep Data Exploration.** The dataset contained multiple imaging modalities — CTA, MRA, MRI T1post, MRI T2 — each with fundamentally different acquisition physics and visual characteristics. Before writing a single line of model code, significant time was spent understanding what each modality *looks like*, how Hounsfield units behave in CT versus signal intensities in MRI, and how aneurysms manifest differently across these scan types.
-
-A key insight came from the manufacturer metadata: even within a single modality, scans from different scanner manufacturers had vastly different intensity distributions, slice spacings, and resolutions. This drove a month-long investigation into clustering and normalization strategies, exploring multiple techniques before converging on a robust approach.
-
-**Preprocessing Design.** The final preprocessing pipelines were designed separately for CT-based scans (CTA) and MRI-based scans (MRA, T1post, T2), each tuned to handle the specific physics and artifacts of that modality. Coordinate transformation logic was built to correctly map the radiologist's 2D DICOM annotations into the 3D resampled voxel space — a non-trivial challenge with multiframe DICOMs and varying frame-of-reference origins.
-
-**Model Architecture.** The model strategy was inspired by the scale mismatch between aneurysms (small, millimeter-sized structures) and full brain scans (large 3D volumes). This led to a two-stage design: a patch-level model that learns local features, followed by a scan-level model that reasons globally.
+The pipeline handles both **CTA** and **MRA** modalities with modality-specific preprocessing branches, runs distributed training across dual GPUs using PyTorch DDP, and was fully developed and trained on Kaggle (T4×2).
 
 ---
 
-## Dataset & Modalities
+## The Challenge
 
-The competition dataset contains DICOM brain scans from multiple hospitals and scanner manufacturers. Each scan is annotated with:
-- Aneurysm presence/absence
-- 2D pixel coordinates on a specific DICOM slice (for positive cases)
-- Arterial location label from 13 possible locations
+The RSNA competition presented several hard technical problems:
 
-| Modality | Description | Key Challenge |
-|----------|-------------|---------------|
-| **CTA** | CT Angiography — high-res vascular contrast | HU windowing, bone/vessel separation |
-| **MRA** | MR Angiography — vascular-sensitive MRI | Highly variable intensity, manufacturer differences |
-| **MRI T1post** | Post-contrast T1-weighted MRI | Lower vascular contrast than CTA |
-| **MRI T2** | T2-weighted MRI | Fluid-bright, different tissue contrast |
-
-The dataset is heavily imbalanced: the majority of scan patches do not contain an aneurysm.
+- **Multi-modal data**: CTA and MRA have fundamentally different intensity characteristics, voxel spacings, and acquisition protocols — and cannot be treated identically.
+- **Scanner heterogeneity**: Scans came from different manufacturers and machines, causing significant distribution shift even within the same modality.
+- **Extreme class imbalance**: The ratio of negative patches (no aneurysm) to positive patches reached 1000:1 in raw data.
+- **Small lesions in large volumes**: Aneurysms are only a few millimeters — tiny relative to the full 3D volume.
+- **Multi-label output**: The model predicts not just *whether* an aneurysm is present, but *which artery* it belongs to (13 possible anatomical locations).
+- **Compute constraints**: Full 3D volumes exceeded GPU memory, requiring a careful patch-based approach with efficient HDF5 I/O.
 
 ---
 
-## Pipeline Overview
+## Dataset & Data Exploration
 
-```
-Raw DICOM Scans
-      │
-      ▼
-┌─────────────────────────────────────┐
-│  Preprocessing (modality-specific)  │
-│  • DICOM → 3D volume                │
-│  • Resampling to isotropic spacing  │
-│  • Intensity normalization          │
-│  • 2D annotation → 3D voxel coords  │
-└────────────────┬────────────────────┘
-                 │
-                 ▼
-      HDF5 Storage (float16, gzip)
-                 │
-                 ▼
-┌─────────────────────────────────────┐
-│   3D Sliding Window Patching        │
-│   • 96×96×96 voxel patches          │
-│   • Stride-based full coverage      │
-│   • Manifest CSVs with patch coords │
-└────────────────┬────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────┐
-│  Phase 1: Patch-Level Model         │
-│  HybridAneurysmClassifier           │
-│  • Modality-specific CNN stems      │
-│  • Shared SwinUNETR transformer     │
-│  • Hierarchical dual-head output    │
-│    ├── Aneurysm Present (binary)    │
-│    └── Artery Location (13-class)   │
-└────────────────┬────────────────────┘
-                 │  (extract embeddings)
-                 ▼
-┌─────────────────────────────────────┐
-│  Phase 2: Scan-Level Model          │
-│  HierarchicalTransformer            │
-│  • Local Transformer (patch→block)  │
-│  • Global Transformer (block→scan)  │
-│  • Final scan-level prediction      │
-└─────────────────────────────────────┘
-```
+The dataset contains thousands of 3D brain scans across two imaging modalities:
+
+| Modality | Description |
+|----------|-------------|
+| **CTA** | CT Angiography — contrast-enhanced CT highlighting blood vessels, with standardized Hounsfield Units |
+| **MRA** | MR Angiography — MRI-based vascular imaging; includes TOF-MRA and contrast-enhanced variants with arbitrary intensity scales |
+
+### Deep Dive into the Data
+
+I spent the first month of the project on data exploration before touching any model. The key discoveries:
+
+- **CTA scans** have a standardized HU scale (~-1000 to +3000), and a vascular window (roughly 400–600 HU) is optimal for highlighting aneurysms.
+- **MRA scans** have no HU scale — intensities are manufacturer-dependent and scanner-specific. TOF-MRA and CE-MRA require completely different normalization strategies.
+- Even within MRA, scans from different scanners had different orientation conventions and wildly different slice spacings.
+- **Clustering analysis** (see `clustering/`) was used to identify distinct data subgroups and inform preprocessing strategy before writing a single line of model code.
+- The localization labels (`train_localizers.csv`) provided 2D pixel coordinates per DICOM slice, which required transformation through the DICOM geometry matrices into 3D voxel coordinates — a step that had to be done *after* resampling.
+
+This month of exploration was the single biggest factor in building a reliable preprocessing pipeline.
 
 ---
 
-## Preprocessing
+## Data Preprocessing Pipeline
 
-Two separate, modality-aware preprocessing pipelines were built:
+All scans are preprocessed into a unified HDF5 file (`processed_scans.hdf5`) stored as float16 to minimize disk and memory footprint. The pipeline runs in parallel using Python `multiprocessing` with a file-based lock for safe concurrent HDF5 writes.
 
-### CT / CTA Pipeline (`preprocess_ct.py`)
+### CTA Preprocessing (`preprocess_ct.py`)
 
-- Reads DICOM series with SimpleITK, handles multiframe and single-frame formats
-- Resamples to isotropic voxel spacing using B-spline interpolation
-- Applies HU windowing specific to the vascular/brain window
-- Maps 2D DICOM pixel annotations to 3D physical coordinates using the ImagePositionPatient and ImageOrientationPatient DICOM tags
-- Handles edge cases: manufacturer-specific frame-of-reference fields, multiframe `PerFrameFunctionalGroupsSequence` extraction
+1. Load DICOM series using SimpleITK
+2. Resample to isotropic voxel spacing
+3. Apply vascular HU windowing (clip + normalize)
+4. Transform per-slice 2D localization coordinates into 3D voxel space using DICOM geometry
+5. Save as float16 to HDF5
 
-### MRI / MRA Pipeline (`prep_mr.py`)
+### MRA Preprocessing (`prep_mr.py`)
 
-- Handles the diversity of MRI acquisition protocols and scanner manufacturers
-- Applies modality-aware normalization (z-score or percentile clipping rather than HU windowing)
-- Resolves the frame number `f` embedded in annotation coordinates for multiframe MRI DICOMs
-- Implements peak-finding heuristics (`scipy.signal.find_peaks`) to identify the correct DICOM slice from the manufacturer-provided frame index
+1. Load DICOM series using SimpleITK
+2. Detect acquisition sub-type from DICOM metadata (TOF-MRA, CE-MRA, etc.)
+3. Apply sub-type-specific normalization (percentile clipping, z-score, or min-max)
+4. Resample to target isotropic spacing
+5. Transform localization coordinates to 3D space
+6. Save as float16 to HDF5
 
-### Storage Format
+### Patch Manifest Generation (`patching_hdf5.py`)
 
-All processed scans are stored in a single HDF5 file (`processed_scans.hdf5`) using:
-- `float16` precision to reduce memory footprint
-- Chunked storage `(32, 32, 32)` for efficient random patch reads
-- GZIP compression
-- A file-lock mechanism (`*.lock` files) for safe parallel multi-process writes
+After preprocessing, every scan is sliced into overlapping 3D patches and a manifest CSV is generated:
 
-```
-processed_data_unified/
-├── processed_scans.hdf5        # All 3D volumes
-├── preprocessing_log.csv       # Status per scan
-└── localization_manifest.csv   # Coordinates + labels for all scans
-```
-
----
-
-## 3D Patch Strategy
-
-Because aneurysms are small relative to the full brain volume, the scan is divided into overlapping 3D patches using a sliding window approach.
-
-| Parameter | Value |
-|-----------|-------|
+| Setting | Value |
+|---------|-------|
 | Patch size | 96 × 96 × 96 voxels |
-| Stride | 64 voxels |
-| Coverage | Full scan (last patch snapped to boundary) |
-| Label assignment | Aneurysm present if center coordinate falls in patch |
-| Artery labels | OR-aggregated across all aneurysms in patch |
-| Relative coords | Aneurysm position relative to patch origin |
+| Stride | 64 voxels (overlapping) |
+| Train/Test split | 80/20 patient-level (no data leakage) |
+| Manifest columns | `series_uid`, `start_z/y/x`, `Aneurysm Present`, `relative_coords`, 13× artery labels |
 
-Patches are not saved to disk. Instead, **manifest CSVs** store the `(series_uid, start_z, start_y, start_x)` for each patch. At training time, patches are read on-the-fly from the HDF5 file via memory-mapped access.
-
-```
-aneurysm_dataset_manifests_hdf5/
-├── train_manifest.csv
-└── test_manifest.csv
-```
-
-The train/test split is done at the **scan (patient) level** to prevent data leakage.
+At runtime, patches are read directly from HDF5 using coordinate offsets — no patch files are ever written to disk.
 
 ---
 
-## Model Architecture
+## Patch-Level Model — Stage 1
 
-### Phase 1 — Patch-Level Hybrid Classifier
+📓 **Kaggle Notebook**: [`training-aneurysm-kaggle`](https://www.kaggle.com/code/bhaveshsolanki32/training-aneurysm-kaggle)
 
-The core design challenge: different modalities have completely different low-level features (HU ranges, vessel contrast, noise characteristics), but a shared high-level reasoning module should be able to recognize aneurysm morphology across all of them.
+### Architecture: Hybrid CNN-SwinUNETR Classifier
 
-**Solution: modality-specific CNN stems + a shared Swin Transformer body.**
+The model (`HybridAneurysmClassifier`) has three components:
 
-```
-Input 96×96×96 Patch (single-channel)
-        │
-        ▼
-┌────────────────────────────┐
-│  Modality-Specific Stem    │  ← Pretrained weights extracted from:
-│  CTA / MRA: SegResNet      │     • SegResNet (whole-body CT segmentation)
-│  MRI T1post: BraTS T1c     │     • SwinUNETR (BTCV segmentation)
-│  MRI T2:    BraTS T2w      │     • BraTS MRI segmentation model
-│  Output: 128 channels      │
-└────────────┬───────────────┘
-             │
-             ▼
-     Linear Bridge (128 → 768)
-     GELU + Dropout
-             │
-             ▼
-┌────────────────────────────┐
-│   SwinUNETR Transformer    │  ← Pretrained on BTCV
-│   (shared across modalities│
-│    SWIN_EMBED_DIM = 768)   │
-│   4 Swin layers            │
-│   Global average pooling   │
-└────────────┬───────────────┘
-             │
-    ┌────────┴──────────┐
-    ▼                   ▼
-Aneurysm Head       Artery Head
-LayerNorm → Linear  LayerNorm → Linear
-768 → 384 → 1       768 → 384 → 13
-(binary logit)      (multi-label logits)
-```
+#### 1. Modality-Specific CNN Stems
 
-**Key design choices:**
-- CNN stems use pretrained weights from publicly available MONAI Model Zoo checkpoints, adapting single-channel BraTS weights by extracting the relevant channel slice (T1c channel for T1post, T2 channel for T2w)
-- The bridge layer projects from the stem output dimensionality to the SwinUNETR embedding dimension, allowing the pretrained transformer to receive properly-shaped token sequences
-- Two separate classification heads allow independent optimization of the coarse task (aneurysm present?) and the fine-grained task (which artery?)
+Each modality (CTA, MRA) gets its own lightweight CNN stem that learns modality-specific low-level features and projects them to a shared embedding space (`128 → 768` via a GELU linear bridge). This lets the shared backbone focus on task-relevant features while the stems absorb imaging-specific variance.
 
-### Phase 2 — Scan-Level Hierarchical Transformer
+#### 2. SwinUNETR Backbone
 
-After Phase 1 training, embeddings are extracted from the penultimate layer of the patch-level model for every patch in every scan. These embeddings (dim=768) are stored in an HDF5 file.
+A pretrained `SwinUNETR` from MONAI serves as the shared 3D feature extractor. It processes 96³ patches and outputs a 768-dimensional patch embedding.
 
-The scan-level model then performs **two-stage spatial aggregation**:
+- **Embed dim**: 768
+- **Pretrained on**: BTCV whole-body CT segmentation + BraTS MRI segmentation
+- **Architecture**: Hierarchical Swin Transformer with shifted-window attention
+
+#### 3. Multi-Label Classification Head
+
+The 768-dim embedding feeds into a multi-label head producing **14 outputs**:
+
+- 1 binary output: *Aneurysm Present* (yes/no)
+- 13 binary outputs: *which artery* (Left/Right ICA, MCA, ACA, AComA, PComA, Basilar Tip, etc.)
+
+### Loss: Hierarchical Focal Loss
+
+A custom loss function combines two objectives with separate weighting:
 
 ```
-Patch Embeddings (N patches × 768)
-for a full 3D scan
-        │
-        ▼
-┌─────────────────────────────┐
-│   Local Transformer Stage   │  Patches grouped into spatial blocks
-│   Depth=2, Heads=6          │  (128×128×128 voxel regions)
-│   + Sinusoidal pos embed     │
-│   + CLS token per block      │
-│   → Block-level embedding    │
-└────────────┬────────────────┘
-             │
-             ▼
-┌─────────────────────────────┐
-│   Global Transformer Stage  │  Block CLS tokens from full scan
-│   Depth=4, Heads=6          │
-│   + Sinusoidal pos embed     │
-│   → Scan-level embedding     │
-└────────────┬────────────────┘
-             │
-    ┌────────┴──────────┐
-    ▼                   ▼
-Aneurysm Head       Artery Head
-LayerNorm → Linear  LayerNorm → Linear
-384 → 1             384 → 13
-```
-
-This two-stage design allows the model to first understand local spatial relationships between neighboring patches (local transformer), then reason about the full anatomical extent of the scan (global transformer) — analogous to how a radiologist scans a full volume and then focuses on suspicious regions.
-
-Positional embeddings are **sinusoidal** (non-learnable), making the model robust to variable numbers of patches across scans of different sizes.
-
----
-
-## Loss Function
-
-A custom **Hierarchical Focal Loss** (`HierarchicalAneurysmLoss`) was designed to handle:
-
-1. **Class imbalance** — aneurysms are rare, most patches are negative
-2. **Task hierarchy** — detecting an aneurysm is the primary task; localizing the artery is conditional on that
-3. **Label semantics** — artery location labels benefit from soft treatment (label smoothing), while presence/absence is a hard binary label
-
-```python
-Total Loss = W_aneurysm × FocalLoss(aneurysm_logits, aneurysm_labels)
-           + W_artery   × BCE(artery_logits[positive_mask], artery_labels[positive_mask])
+L = W_aneurysm × FocalLoss(detection_pred, detection_label)
+  + W_artery   × FocalLoss(artery_preds,   artery_labels)
 ```
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| `W_aneurysm` | 5.0 | Presence detection is the primary task |
-| `W_artery` | 1.0 | Location is conditional/secondary |
-| Focal α | 0.25 | Handles positive/negative imbalance |
-| Focal γ | 2.0 | Down-weights easy negatives |
-| Artery loss | BCE (not Focal) | Allows soft label smoothing for anatomical similarity |
+| `W_aneurysm` | 5.0 | Detection is the primary task |
+| `W_artery` | 1.0 | Location is secondary |
+| Focal `alpha` | 0.25 | Handles positive/negative imbalance |
+| Focal `gamma` | 2.0 | Down-weights easy negatives |
 
-**Masking**: the artery location loss is only computed on patches where an aneurysm is present (`aneurysm_present_mask`). This prevents the artery head from receiving gradients on negative patches, enforcing the hierarchical dependency.
+Focal Loss was essential — standard cross-entropy was dominated by the flood of easy negatives and failed to learn meaningful signal.
 
-For the scan-level model, **AUCMLoss** (`libauc`) replaces standard BCE to directly optimize the area under the ROC curve — a better surrogate for the competition metric on imbalanced data.
+---
+
+## Scan-Level Model — Stage 2
+
+📓 **Embedding Extraction**: [`model-data-collection-patch`](https://www.kaggle.com/code/bhaveshsolanki32/model-data-collection-patch)  
+📓 **Scan-Level Training**: [`scan-level-model-rsna`](https://www.kaggle.com/code/bhaveshsolanki32/scan-level-model-rsna/notebook)
+
+### From Patches to Scans
+
+The patch model classifies each 96³ sub-volume, but a clinical diagnosis requires a **scan-level prediction**: is there an aneurysm anywhere in this patient's brain?
+
+This is a classic **Multiple Instance Learning (MIL)** problem: given a bag of patch embeddings, predict the bag label.
+
+### Pipeline
+
+**Step 1 — Embedding Extraction**  
+The trained patch-level model runs in inference mode over all patches of every scan. The 768-dim feature vector from a penultimate layer is extracted and stored by scan in HDF5 (`extracted_embeddings.hdf5`).
+
+**Step 2 — Hierarchical Scan Transformer**  
+The scan-level model processes the full bag of patch embeddings for a scan:
+
+- **Local Transformer** (depth=2, heads=6): Attends within spatial blocks of `128³` voxels, capturing neighborhood context.
+- **Global Transformer** (depth=4, heads=6): Attends across all blocks, integrating whole-brain evidence.
+- **Classification Head**: 14 predictions (same label space as patch model).
+
+**Step 3 — AUC-Maximizing Loss**  
+Training uses `AUCMLoss` from the `libauc` library, which directly maximizes AUROC. This aligns the training objective with the evaluation metric, unlike cross-entropy which optimizes accuracy.
 
 ---
 
 ## Training Strategy
 
-### Hardware
-- Kaggle notebooks with **2× NVIDIA T4 GPUs**
-- **Distributed Data Parallel (DDP)** via `torch.distributed` + NCCL backend
-- **Mixed precision** training with `torch.cuda.amp`
-- Training done in **multiple sessions** (checkpointing between Kaggle notebook runs)
+Training was done in **multiple sequential sessions** due to Kaggle's GPU time limit (~9 hours per session on T4×2). Checkpoints were saved after each session and resumed in the next.
 
-### Phase 1 Training (Patch-Level)
+### Patch Model — Two-Phase Training
+
+| Phase | Epochs | LR | Frozen? |
+|-------|--------|-----|---------|
+| Phase 1 — Warmup | 6 | `1e-3` | SwinUNETR frozen (train stems + head only) |
+| Phase 2 — Fine-tune | 8 | `5e-5` | Full model unfrozen |
+
+### Optimization Setup
 
 | Setting | Value |
 |---------|-------|
-| Batch size | 10 (per GPU) |
-| Gradient accumulation | 2 steps → effective batch 40 |
-| Phase 1 LR | 1e-3 (stem + head unfrozen) |
-| Phase 2 LR | 5e-5 (full fine-tuning) |
-| Scheduler | CosineAnnealingLR |
-| Early stopping | Patience = 15 epochs |
-| Dropout | 0.3 |
+| Optimizer | AdamW |
+| LR Schedule | Cosine Annealing |
+| Gradient Accumulation | 2 steps |
+| Early Stopping | Patience = 15 epochs |
+| Mixed Precision | float16 |
+| Distributed Training | PyTorch DDP — 2× T4 GPUs |
+| Dynamic Undersampling | 30 negatives per positive per epoch |
+| Batch Size | 10 (patch model), 120 (scan model) |
 
-**Dynamic Undersampling**: each epoch, a fresh subset of negative patches is drawn at a 30:1 negative-to-positive ratio, ensuring the model sees every positive patch while preventing it from memorizing specific negatives.
+### Data Augmentation
 
-**Augmentations (GPU-accelerated via MONAI):**
-- Random flip along all 3 axes
+Applied to patches during training:
+- Random axis-aligned flips (3 axes)
 - Random 90° rotations
-- Random small-angle rotations (±25°)
+- Small random rotations (±15°)
+- Random contrast adjustment
 - Random intensity scaling
-- Random contrast adjustment (gamma correction)
-
-### Phase 2 Training (Scan-Level)
-
-| Setting | Value |
-|---------|-------|
-| Batch size | 120 embeddings |
-| Epochs | up to 100 (early stopping) |
-| LR | 5e-5 |
-| Optimizer | AUCMLoss (libauc) |
-| Early stopping | Patience = 6 epochs |
-| Dropout | 0.2 |
+- Spatial padding to enforce fixed 96³ size
 
 ---
 
 ## Results
 
-> _Graphs and detailed metrics to be added. Placeholder sections below._
+> 📊 *Add metric values and plots from training_history.json after training runs complete. Placeholder structure below.*
 
-### Training Curves
+### Patch-Level Model
 
-<!-- Insert training loss and PR-AUC curves here -->
+| Metric | Train | Validation |
+|--------|-------|------------|
+| Aneurysm Detection AUROC | — | — |
+| Mean Artery Location AUROC | — | — |
+| Average Precision (AP) | — | — |
+
+**Training Curves**  
+<!-- Insert training_loss_curve.png here -->
+
+**ROC Curve — Aneurysm Detection**  
+<!-- Insert roc_curve_aneurysm.png here -->
+
+**Per-Artery AUROC Breakdown**  
+<!-- Insert per_class_auroc_bar.png here -->
+
+### Scan-Level Model
+
 | Metric | Value |
 |--------|-------|
-| Patch-level PR-AUC (test) | *(add result)* |
-| Scan-level ROC-AUC (test) | *(add result)* |
-
-### Confusion Matrix & ROC Curves
-
-<!-- Insert confusion matrix image here -->
-<!-- Insert ROC and Precision-Recall curves here -->
-
-### Per-Artery Location Performance
-
-<!-- Insert per-class performance table or bar chart here -->
+| Scan-Level AUROC | — |
+| Scan-Level Average Precision | — |
 
 ---
 
@@ -365,134 +250,158 @@ For the scan-level model, **AUCMLoss** (`libauc`) replaces standard BCE to direc
 ```
 Aneurysm_detection/
 │
-├── preprocessing/
-│   ├── preprocess_ct.py          # CTA preprocessing pipeline
-│   ├── prep_mr.py                # MRA/MRI preprocessing pipeline
-│   ├── save_cta.py               # Parallel CTA processing → HDF5
-│   ├── save_mr.py                # Parallel MRA processing → HDF5
-│   └── save_all.py               # Unified pipeline (all modalities)
+├── 📄 preprocess_ct.py               # CTA preprocessing: HU windowing, resampling, coord transform
+├── 📄 prep_mr.py                     # MRA preprocessing: modality-aware normalization
+├── 📄 save_cta.py                    # Parallel CTA processing → NIfTI
+├── 📄 save_mr.py                     # Parallel MRA processing → HDF5
+├── 📄 save_all.py                    # Unified CTA+MRA dispatcher → single HDF5 (batched, fault-tolerant)
 │
-├── patching/
-│   ├── patching.py               # Patch manifest creation (NPY backend)
-│   └── patching_hdf5.py          # Patch manifest creation (HDF5 backend)
+├── 📄 patching.py                    # Patch manifest generator (NPY-based)
+├── 📄 patching_hdf5.py               # Patch manifest generator (HDF5-based — used in final pipeline)
 │
-├── models/
-│   └── (saved model checkpoints)
+├── 📄 view3d_data.py                 # Interactive 3D volume + aneurysm viewer (ipywidgets)
+├── 📄 verify_hdf5.py                 # QA: extract JPEG slices from HDF5 for visual inspection
+├── 📄 savee_2d_images.py             # Extract 2D slices from NIfTI files
+├── 📄 nii_to_npy.py                  # NIfTI → NumPy conversion utility
 │
-├── training/
-│   ├── training-aneurysm-kaggle.ipynb   # Phase 1: Patch-level training (Kaggle)
-│   └── scan-level-model-rsna.ipynb      # Phase 2: Scan-level training (Kaggle)
+├── 📁 clustering/                    # Data exploration: modality clustering analysis
+├── 📁 models/                        # Saved model checkpoints (not tracked by git LFS)
 │
-├── clustering/
-│   └── (data exploration & clustering notebooks)
+├── 📁 aneurysm_dataset_manifests_hdf5_ho/
+│   ├── train_manifest.csv            # Patch-level training manifest
+│   └── test_manifest.csv             # Patch-level test manifest
 │
-├── utils/
-│   ├── view3d_data.py            # 3D volume viewer with crosshair visualization
-│   ├── verify_hdf5.py            # HDF5 integrity verification & slice extraction
-│   └── savee_2d_images.py        # 2D slice export for visual inspection
+├── 📁 processed_data_unified/
+│   ├── localization_manifest.csv     # Scan-level labels with 3D coordinates
+│   └── preprocessing_log.csv        # Per-scan preprocessing status
 │
-├── mra.ipynb                     # MRA data exploration notebook
-├── train_data.ipynb              # Training data analysis
-├── test.ipynb                    # Inference / evaluation notebook
-│
-├── processed_data_unified/
-│   ├── localization_manifest.csv # Final training labels with 3D coordinates
-│   └── preprocessing_log.csv     # Per-scan processing status
-│
-└── aneurysm_dataset_manifests_hdf5_ho/
-    ├── train_manifest.csv         # Patch-level training set
-    └── test_manifest.csv          # Patch-level test set
+├── 📄 mra.ipynb                      # MRA data exploration
+├── 📄 train_data.ipynb               # Training data analysis
+└── 📄 test.ipynb                     # Model evaluation
 ```
 
 ---
 
-## Setup & Usage
+## Tech Stack
 
-### Requirements
+| Category | Library / Tool |
+|----------|---------------|
+| **Deep Learning** | PyTorch, MONAI |
+| **Architecture** | SwinUNETR, SegResNet (MONAI pretrained) |
+| **Medical Imaging I/O** | SimpleITK, h5py, NiBabel |
+| **Training Infra** | PyTorch DDP, CosineAnnealingLR, gradient accumulation |
+| **Loss Functions** | Custom Hierarchical Focal Loss, AUCMLoss (libauc) |
+| **Augmentation** | MONAI Transforms |
+| **Data** | HDF5, NumPy, Pandas |
+| **Metrics & Eval** | scikit-learn (ROC AUC, AP, confusion matrix, classification report) |
+| **Visualization** | Matplotlib, Seaborn, ipywidgets, PIL |
+| **Parallelism** | Python `multiprocessing`, `concurrent.futures` |
+
+---
+
+## Kaggle Notebooks
+
+| Notebook | Purpose |
+|----------|---------|
+| [training-aneurysm-kaggle](https://www.kaggle.com/code/bhaveshsolanki32/training-aneurysm-kaggle) | Patch-level model training (DDP, multi-phase, full evaluation) |
+| [model-data-collection-patch](https://www.kaggle.com/code/bhaveshsolanki32/model-data-collection-patch) | Patch embedding extraction for scan-level model input |
+| [scan-level-model-rsna](https://www.kaggle.com/code/bhaveshsolanki32/scan-level-model-rsna/notebook) | Scan-level hierarchical transformer training and evaluation |
+
+---
+
+## How to Run
+
+### Prerequisites
 
 ```bash
-pip install torch torchvision monai[all] h5py SimpleITK pydicom \
-            numpy pandas scikit-learn scipy tqdm libauc matplotlib seaborn
+pip install torch monai[all] SimpleITK h5py pandas scikit-learn tqdm libauc
 ```
 
-### Step 1 — Preprocess Scans
+### 1. Preprocess All Scans
 
 ```bash
-# Preprocess all modalities (CTA + MRA/MRI) in parallel → HDF5
+# Edit BASE_PATH and OUTPUT_HDF5_PATH in save_all.py, then:
 python save_all.py
 ```
 
-Configure paths in the `CONFIGURATION` block at the top of `save_all.py`:
-- `BASE_PATH`: path to raw DICOM series
-- `ORIGINAL_LOCALIZATION_CSV`: competition annotation CSV
-- `OUTPUT_DIR`: output directory for HDF5 and manifests
+Processes all CTA and MRA scans in parallel, dispatching to modality-specific pipelines. Saves everything to a single HDF5 file. Fault-tolerant: already-processed scans are skipped on re-run.
 
-### Step 2 — Generate Patch Manifests
+### 2. Generate Patch Manifests
 
 ```bash
-# Create train/test patch manifests from the HDF5 file
+# Edit HDF5_DATA_PATH and LOCALIZATION_CSV_PATH in patching_hdf5.py, then:
 python patching_hdf5.py
 ```
 
-Configurable: `PATCH_SIZE`, `STRIDE`, `TRAIN_SIZE`, `HDF5_DATA_PATH`.
+Outputs `train_manifest.csv` and `test_manifest.csv` with all patch coordinates and labels.
 
-### Step 3 — Train Phase 1 (Patch-Level)
+### 3. Train Patch-Level Model
 
-Open `training/training-aneurysm-kaggle.ipynb` in Kaggle (T4×2 recommended).  
-The notebook writes `train_ddp.py` and runs it via `!python train_ddp.py`.
+Upload the HDF5 file and manifests to Kaggle, then run:  
+[`training-aneurysm-kaggle`](https://www.kaggle.com/code/bhaveshsolanki32/training-aneurysm-kaggle)
 
-Key configuration in `Config` class:
-- Set `HDF5_DATA_PATH`, `TRAIN_MANIFEST_HDF5`, `TEST_MANIFEST_HDF5`
-- Set `SEGRESNET_WEIGHTS`, `SWIN_UNETR_WEIGHTS`, `BRATS_MRI_WEIGHTS` (MONAI Model Zoo)
+### 4. Extract Patch Embeddings
 
-### Step 4 — Extract Embeddings & Train Phase 2
+With the trained patch model checkpoint, run:  
+[`model-data-collection-patch`](https://www.kaggle.com/code/bhaveshsolanki32/model-data-collection-patch)
 
-After Phase 1 training, run the embedding extraction cell, then open `training/scan-level-model-rsna.ipynb` to train the scan-level `HierarchicalTransformer`.
+### 5. Train Scan-Level Model
 
-### Visualize a Scan
+Upload `extracted_embeddings.hdf5`, then run:  
+[`scan-level-model-rsna`](https://www.kaggle.com/code/bhaveshsolanki32/scan-level-model-rsna/notebook)
+
+### Visualize Data
 
 ```python
+# Interactive 3D viewer with aneurysm crosshair overlay (in Jupyter)
 from view3d_data import view_3d_volume
-import h5py, numpy as np
+import h5py
 
-with h5py.File("processed_data_unified/processed_scans.hdf5", "r") as f:
-    volume = f["<series_uid>"][()].astype(np.float32)
+with h5py.File("processed_scans.hdf5", "r") as f:
+    vol = f["<series_uid>"][()]
 
-# Optional: pass known aneurysm coordinates as (z, y, x) tuples
-view_3d_volume(volume, crosshair_coords=[(42, 128, 96)])
+view_3d_volume(vol, crosshair_coords=[(z, y, x)])
+```
+
+```bash
+# Quick visual QA — extract JPEG slices from all scans in HDF5
+python verify_hdf5.py
 ```
 
 ---
 
-## Technologies Used
+## Key Design Decisions
 
-| Category | Tools |
-|----------|-------|
-| Deep Learning | PyTorch, MONAI, SwinUNETR, SegResNet |
-| Medical Imaging | SimpleITK, pydicom |
-| Data Processing | NumPy, Pandas, SciPy, HDF5 (h5py) |
-| Training Optimization | DDP (torch.distributed), AMP (torch.cuda.amp), libauc |
-| Visualization | Matplotlib, Seaborn, ipywidgets |
-| Infrastructure | Kaggle (T4×2 GPU), multiprocessing.Pool, file-lock concurrency |
+**Why HDF5 over individual NIfTI files?**  
+HDF5 enables random-access patch reads — during training, only the 96³ patch being loaded is read from disk, not the whole scan. With millions of patches across thousands of scans, this is the difference between a practical training loop and an I/O bottleneck.
+
+**Why modality-specific CNN stems?**  
+CTA intensities are in Hounsfield Units with physical meaning; MRA intensities are arbitrary and scanner-dependent. A shared first layer trained on raw voxels would produce incompatible representations. The stems act as learned normalization layers, projecting each modality into a shared feature space before the SwinUNETR sees them.
+
+**Why a two-stage pipeline rather than end-to-end 3D?**  
+Full brain volumes (512×512×200+ voxels) do not fit in T4 GPU memory for 3D convolutions at useful batch sizes. More importantly, the two-stage design mirrors radiologist workflow: *find suspicious patches*, then *make a global judgment across the scan*. The MIL framing is also better suited for the training signal available (scan-level labels with noisy 3D localization).
+
+**Why dynamic undersampling rather than class weighting?**  
+At 30:1 negative-to-positive sampling per epoch, the model sees a realistic but manageable number of negatives. Class weighting alone inflated gradients from negatives in early training, causing instability. Dynamic undersampling proved more stable and gave the model a better implicit curriculum.
+
+**Why AUCMLoss for the scan-level model?**  
+Clinical deployment cares about ranking (is this scan more likely to have an aneurysm than that one?) not about a fixed threshold. AUROC directly measures ranking quality. AUCMLoss optimizes AUROC end-to-end, aligning training and evaluation — cross-entropy was a proxy at best.
 
 ---
 
-## Key Engineering Highlights
+## Author
 
-- **Multi-modal transfer learning**: extracted modality-specific channel slices from BraTS pretrained weights to initialize single-channel MRI stems — allowing transfer from a 4-channel model without retraining from scratch.
-- **Coordinate pipeline**: end-to-end DICOM annotation → 3D voxel coordinate transformation, handling both single-frame and multiframe DICOM edge cases including `PerFrameFunctionalGroupsSequence`.
-- **Memory-efficient HDF5 pipeline**: float16 storage with chunking and gzip, combined with on-the-fly patch extraction — enabling training on a dataset too large to fit in RAM.
-- **File-lock based safe parallel writes**: atomic file-based locking (`os.O_CREAT | os.O_EXCL`) for race-condition-free multi-process HDF5 writes without relying on a shared memory manager.
-- **Hierarchical loss with conditional masking**: artery location loss computed only on positive samples, enforcing the medical prior that location is meaningless without presence.
+**Bhavesh Solanki**  
+B.Tech Student — NSUT (Netaji Subhas University of Technology), Delhi  
+Published IEEE Researcher — *ECG Anomaly Detection Using Machine Learning: Comparative Analysis* (IEEE DELCON 2025)
+
+[Kaggle](https://www.kaggle.com/bhaveshsolanki32) · [GitHub](https://github.com/BhaveshSolanki32)
 
 ---
 
 ## Acknowledgements
 
-- [RSNA](https://www.rsna.org/) and [Kaggle](https://www.kaggle.com/) for organizing the competition and providing the dataset
-- [MONAI](https://monai.io/) for pretrained medical imaging models (SegResNet, SwinUNETR, BraTS)
-- [libauc](https://libauc.org/) for AUC-optimized loss functions
-
----
-
-*This project was developed as part of the RSNA Intracranial Aneurysm Detection Kaggle Competition.*
+- [RSNA](https://www.rsna.org/) for organizing the competition and providing the dataset
+- [MONAI](https://monai.io/) for the SwinUNETR implementation and medical imaging pretrained weights
+- [libauc](https://libauc.org/) for the AUCMLoss implementation
+- The Kaggle community for open discussion and shared insights on medical imaging competitions
